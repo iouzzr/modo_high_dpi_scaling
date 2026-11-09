@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package version="801">
+  <kit name="high_dpi_scaling" restart="YES">
+    <source target="high_dpi_scaling/index.cfg">index.cfg</source>
+    <source target="high_dpi_scaling/high_dpi_scaling.dll">high_dpi_scaling.dll</source>
+    <source target="high_dpi_scaling/lxserv/high_dpi_scaling_plugin.py">lxserv/high_dpi_scaling_plugin.py</source>
+  </kit>
+  <message button="OK">High-DPI Scaling Kit installed successfully.</message>
+</package>
