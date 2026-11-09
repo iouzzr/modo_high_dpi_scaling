@@ -39,6 +39,8 @@ typedef uint32_t       (*FnQImagePixel)(const void* this_ptr, int x, int y);
 typedef void           (*FnDrawImageRectRect)(void* painter, const QRectC* tr, const void* img, const QRectC* sr, int flags);
 typedef void           (*FnDrawImageXY)(void* painter, int x, int y, const void* img, int sx, int sy, int sw, int sh, int flags);
 typedef void           (*FnDrawRects)(void* painter, const QRectC* rects, int count);
+typedef void           (*FnDrawLines)(void* painter, const QRectC* lines, int count);
+typedef void           (*FnDrawPoints)(void* painter, const QSizeC* points, int count);
 typedef void           (*FnFillRectBrush)(void* painter, const QRectC* rect, const void* brush);
 typedef const void*    (*FnPainterBrush)(const void* painter);
 typedef void           (*FnPainterSetWindow)(void* painter, int x, int y, int w, int h);
@@ -68,6 +70,8 @@ static FnQImagePixel          g_orig_qimg_pixel      = nullptr;
 static FnDrawImageRectRect    g_orig_draw_image_rr   = nullptr;
 static FnDrawImageXY          g_orig_draw_image_xy   = nullptr;
 static FnDrawRects            g_orig_draw_rects      = nullptr;
+static FnDrawLines            g_orig_draw_lines      = nullptr;
+static FnDrawPoints           g_orig_draw_points     = nullptr;
 static FnFillRectBrush        g_painter_fill_rect    = nullptr;
 static FnPainterBrush         g_painter_brush        = nullptr;
 static FnPainterSetWindow     g_orig_set_window      = nullptr;
@@ -398,11 +402,13 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
     g_orig_draw_image_xy(painter, x, y, img, sx, sy, sw, sh, flags);
 }
 
-// OPALDisp::FillRect (front3000.dll+0x1B503B, return address +0x1B5041) calls helper
-// 0x1A3160 which subtracts 1 from width and height before calling QPainter::drawRects
-// with Qt::NoPen. At 100% scaling this happens to align, but at fractional High-DPI
-// (e.g. 125%, 150%) the 1-logical-pixel reduction leaves a 1px unpainted gap at the
-// right/bottom edges of filled UI rects. Restore full width/height and use fillRect.
+// OPALDisp's 2D grid primitives (FillRect, DrawLine, DrawPoint in dispatch table
+// front3000.dll+0x1B5BE0) are all converted to QPainter::fillRect below so that
+// adjacent logical cells k and k+1 share the exact half-open physical interval
+// [round(k * g_scale), round((k + 1) * g_scale)) with zero 1px gaps or overlaps.
+
+// OPALDisp::FillRect (front3000.dll+0x1B503B, ret +0x1B5041) subtracts 1 from
+// width/height via 0x1A3160 before calling drawRects with Qt::NoPen. Restore +1.
 static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     if (g_scale > 1.001 && painter && rects && count == 1 && g_painter_fill_rect && g_painter_brush) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
@@ -416,6 +422,50 @@ static void HookDrawRects(void* painter, const QRectC* rects, int count) {
         }
     }
     g_orig_draw_rects(painter, rects, count);
+}
+
+// OPALDisp::DrawLine (front3000.dll+0x1B517F, ret +0x1B5185) sets QBrush(color) and
+// a 1-physical-pixel cosmetic QPen (width=0) via 0x1B6140. Convert axis-aligned
+// lines to 1-logical-pixel fillRects to prevent 1px unpainted gaps next to FillRects.
+static void HookDrawLines(void* painter, const QRectC* lines, int count) {
+    if (g_scale > 1.001 && painter && lines && count == 1 && g_painter_fill_rect && g_painter_brush) {
+        const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
+        if (g_front_base && ret == g_front_base + 0x1B5185) {
+            if (lines[0].y1 == lines[0].y2) {
+                int x1 = (lines[0].x1 <= lines[0].x2) ? lines[0].x1 : lines[0].x2;
+                int x2 = (lines[0].x1 <= lines[0].x2) ? lines[0].x2 : lines[0].x1;
+                QRectC full_rect = { x1, lines[0].y1, x2, lines[0].y1 };
+                const void* br = g_painter_brush(painter);
+                g_painter_fill_rect(painter, &full_rect, br);
+                return;
+            }
+            if (lines[0].x1 == lines[0].x2) {
+                int y1 = (lines[0].y1 <= lines[0].y2) ? lines[0].y1 : lines[0].y2;
+                int y2 = (lines[0].y1 <= lines[0].y2) ? lines[0].y2 : lines[0].y1;
+                QRectC full_rect = { lines[0].x1, y1, lines[0].x1, y2 };
+                const void* br = g_painter_brush(painter);
+                g_painter_fill_rect(painter, &full_rect, br);
+                return;
+            }
+        }
+    }
+    g_orig_draw_lines(painter, lines, count);
+}
+
+// OPALDisp::DrawPoint (front3000.dll+0x1B52BC, ret +0x1B52C2) uses a 1-physical-pixel
+// cosmetic pen to erase square FillRect corners and draw checkmarks/arrows. Convert
+// to a 1x1 logical cell fillRect so corner erasing covers the full scaled cell.
+static void HookDrawPoints(void* painter, const QSizeC* points, int count) {
+    if (g_scale > 1.001 && painter && points && count == 1 && g_painter_fill_rect && g_painter_brush) {
+        const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
+        if (g_front_base && ret == g_front_base + 0x1B52C2) {
+            QRectC full_rect = { points[0].w, points[0].h, points[0].w, points[0].h };
+            const void* br = g_painter_brush(painter);
+            g_painter_fill_rect(painter, &full_rect, br);
+            return;
+        }
+    }
+    g_orig_draw_points(painter, points, count);
 }
 
 // Modo calls QPainter::setWindow(0, 0, logical_w, logical_h) when initializing a
@@ -541,6 +591,8 @@ static void InstallAllHooks() {
     void** s_draw_img   = FindIATSlot(front, "?drawImage@QPainter@@QEAAXAEBVQRect@@AEBVQImage@@0V?$QFlags@W4ImageConversionFlag@Qt@@@@@Z");
     void** s_draw_imgxy = FindIATSlot(front, "?drawImage@QPainter@@QEAAXHHAEBVQImage@@HHHHV?$QFlags@W4ImageConversionFlag@Qt@@@@@Z");
     void** s_draw_rects = FindIATSlot(front, "?drawRects@QPainter@@QEAAXPEBVQRect@@H@Z");
+    void** s_draw_lines = FindIATSlot(front, "?drawLines@QPainter@@QEAAXPEBVQLine@@H@Z");
+    void** s_draw_pts   = FindIATSlot(front, "?drawPoints@QPainter@@QEAAXPEBVQPoint@@H@Z");
     void** s_set_win    = FindIATSlot(front, "?setWindow@QPainter@@QEAAXHHHH@Z");
     void** s_font_style = FindIATSlot(front, "?setStyleStrategy@QFont@@QEAAXW4StyleStrategy@1@@Z");
 
@@ -565,6 +617,8 @@ static void InstallAllHooks() {
             PatchSlot(s_draw_img,   reinterpret_cast<void*>(&HookDrawImageRectRect),    reinterpret_cast<void**>(&g_orig_draw_image_rr));
             PatchSlot(s_draw_imgxy, reinterpret_cast<void*>(&HookDrawImageXY),          reinterpret_cast<void**>(&g_orig_draw_image_xy));
             PatchSlot(s_draw_rects, reinterpret_cast<void*>(&HookDrawRects),            reinterpret_cast<void**>(&g_orig_draw_rects));
+            PatchSlot(s_draw_lines, reinterpret_cast<void*>(&HookDrawLines),            reinterpret_cast<void**>(&g_orig_draw_lines));
+            PatchSlot(s_draw_pts,   reinterpret_cast<void*>(&HookDrawPoints),           reinterpret_cast<void**>(&g_orig_draw_points));
             PatchSlot(s_set_win,    reinterpret_cast<void*>(&HookPainterSetWindow),     reinterpret_cast<void**>(&g_orig_set_window));
             PatchSlot(s_font_style, reinterpret_cast<void*>(&HookFontSetStyleStrategy), reinterpret_cast<void**>(&g_orig_font_style));
         }
