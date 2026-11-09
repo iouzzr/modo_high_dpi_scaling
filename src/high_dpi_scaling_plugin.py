@@ -355,9 +355,15 @@ def bootstrap():
     else:
         effective_scale = custom_scale
 
-    # If this IS already the child process, install OpenGL Viewport IAT hooks
-    # BEFORE any Modo window or FBO is created!
+    # If this IS already the child process, clear MODO_HIDPI_CHILD from the
+    # environment block (so future app.restart spawns a fresh bootstrap) and
+    # install OpenGL/2D UI IAT hooks BEFORE any Modo window or FBO is created!
     if os.environ.get("MODO_HIDPI_CHILD") == "1":
+        os.environ.pop("MODO_HIDPI_CHILD", None)
+        try:
+            ctypes.windll.kernel32.SetEnvironmentVariableW("MODO_HIDPI_CHILD", None)
+        except Exception:
+            pass
         install_early_hooks(effective_scale)
         return
 
