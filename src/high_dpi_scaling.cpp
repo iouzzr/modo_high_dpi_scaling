@@ -128,6 +128,11 @@ static void RecordFbo(const void* ptr, int w, int h) {
 
 // ============================================================================
 // 1. 3D OpenGL Viewport Hooks
+//    Modo creates 3D viewport FBOs at logical widget size, queries FBO
+//    width()/height() for logical layout/camera checks, and issues AGLViewport,
+//    AGLScissor, and blitFramebuffer in logical coordinates. We allocate the
+//    FBO at physical High-DPI size, return the recorded logical size from
+//    width()/height(), and scale viewport/scissor/blit rects to physical pixels.
 // ============================================================================
 
 static void* HookFboCtor(void* this_ptr, int w, int h, const void* fmt_ptr) {
@@ -185,8 +190,15 @@ static void HookScissor(int x, int y, int w, int h) {
 
 // ============================================================================
 // 2. 2D UI (OPALDisp / QImage / QPaintDevice / QPainter / QFont) Hooks
+//    Modo's 2D panels, forms, trees, and buttons are rendered by OPAL into an
+//    offscreen QImage buffer (LUXQtWidget::m_image at [widget+0x48]) and then
+//    blitted onto the QWidget in LUXQtWidget::paintEvent. By default, Modo
+//    allocates these offscreen QImages at 1x logical pixel size with DPR=1.0.
 // ============================================================================
 
+// LUXQtWidget::updateImage (front3000.dll+0x172077) constructs its main
+// offscreen backing QImage via QImage(const QSize&, Format). Allocate it at
+// physical High-DPI dimensions and tag it with setDevicePixelRatio(g_scale).
 static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
     if (g_scale > 1.001 && sz && g_qimg_set_dpr) {
         QSizeC scaled_sz = { ScaleInt(sz->w), ScaleInt(sz->h) };
@@ -197,6 +209,10 @@ static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
     return g_orig_qimg_ctor_size(this_ptr, sz, fmt);
 }
 
+// ORastCreate (front3000.dll+0x1B60D0, return address +0x1B60D6) allocates
+// temporary offscreen ARGB32 (fmt == 5) QImages via QImage(int w, int h, Format)
+// for rasterizing text/tabs. Only scale calls originating from ORastCreate so
+// raw icon/texture assets loaded elsewhere via QImage(w, h, fmt) stay 1:1.
 static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
     if (g_scale > 1.001 && fmt == 5 && g_qimg_set_dpr) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
@@ -213,6 +229,9 @@ static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
     return g_orig_qimg_ctor_wh(this_ptr, w, h, fmt);
 }
 
+// Report logical dimensions back to Modo for our High-DPI QImages (dpr > 1.0)
+// so LUXQtWidget::updateImage (0x171F8C..0x172000) and OPAL layout math
+// continue operating in logical coordinates without infinite resize loops.
 static QSizeC* HookQImageSize(const void* this_ptr, QSizeC* out_sz) {
     QSizeC* res = g_orig_qimg_size(this_ptr, out_sz);
     if (g_scale > 1.001 && out_sz && g_qimg_get_dpr && g_qimg_get_dpr(this_ptr) > 1.001) {
@@ -230,6 +249,14 @@ static int HookQImageWidth(const void* this_ptr) {
     return pw;
 }
 
+// Modo renders vertical tab strips by first drawing horizontal text into an
+// ORast QImage, converting it into a logical-sized ILxImage in QImageToILxImage
+// (front3000.dll+0x1A29E0, first querying QImage::height at +0x1A29FB), rotating
+// the ILxImage 90 degrees on the CPU (CCW at +0x1F6C0D -> ret +0x1F6C12, or CW
+// at +0x19733C -> ret +0x197341), and finally blitting via QPainter::drawImage.
+// To prevent downsampling to 1x logical pixels during QImageToILxImage, we
+// pre-rotate the full physical High-DPI QImage into g_rot_buf here and substitute
+// it in HookDrawImageXY below.
 static int HookQImageHeight(const void* this_ptr) {
     int ph = g_orig_qimg_height(this_ptr);
     if (g_scale > 1.001 && g_qimg_get_dpr && g_qimg_get_dpr(this_ptr) > 1.001) {
@@ -285,6 +312,7 @@ static int HookQImageHeight(const void* this_ptr) {
     return ph;
 }
 
+// Check QPaintDevice::devType() (vtable[1]) == QInternal::Image (3)
 static bool IsQImageDevice(const void* this_ptr) {
     if (!this_ptr) return false;
     void* const* vtable = *reinterpret_cast<void* const* const*>(this_ptr);
@@ -309,6 +337,8 @@ static int HookQPaintDeviceHeight(const void* this_ptr) {
     return ph;
 }
 
+// QImage::copy and QImage::pixel operate in physical image coordinates in Qt,
+// whereas Modo passes logical coordinates when cropping/sampling its offscreen QImage.
 static void* HookQImageCopy(const void* this_ptr, void* out_img, int x, int y, int w, int h) {
     if (g_scale > 1.001 && g_qimg_get_dpr && g_qimg_set_dpr && g_qimg_get_dpr(this_ptr) > 1.001) {
         void* res = g_orig_qimg_copy(this_ptr, out_img, ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
@@ -325,6 +355,9 @@ static uint32_t HookQImagePixel(const void* this_ptr, int x, int y) {
     return g_orig_qimg_pixel(this_ptr, x, y);
 }
 
+// In Qt5, QPainter::drawImage(targetRect, image, sourceRect) interprets targetRect
+// in logical painter coordinates but sourceRect in physical QImage pixels even when
+// image.devicePixelRatio() > 1.0. Scale sourceRect from logical to physical pixels.
 static void HookDrawImageRectRect(void* painter, const QRectC* tr, const void* img, const QRectC* sr, int flags) {
     if (g_scale > 1.001 && sr && img && g_qimg_get_dpr && g_qimg_get_dpr(img) > 1.001) {
         int sw = sr->x2 - sr->x1 + 1;
@@ -338,6 +371,8 @@ static void HookDrawImageRectRect(void* painter, const QRectC* tr, const void* i
     g_orig_draw_image_rr(painter, tr, img, sr, flags);
 }
 
+// Intercept the final blit of rotated vertical tab strips (captured in HookQImageHeight)
+// and draw the pre-rotated physical High-DPI buffer (g_rot_buf) instead of the 1x ILxImage.
 static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx, int sy, int sw, int sh, int flags) {
     if (g_scale > 1.001 && g_rot_valid && sx == 0 && sy == 0 && sw == g_rot_lw && sh == g_rot_lh &&
         g_orig_qimg_ctor_wh && g_qimg_dtor && g_qimg_scanline && g_qimg_set_dpr && g_orig_draw_image_rr) {
@@ -363,6 +398,11 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
     g_orig_draw_image_xy(painter, x, y, img, sx, sy, sw, sh, flags);
 }
 
+// OPALDisp::FillRect (front3000.dll+0x1B503B, return address +0x1B5041) calls helper
+// 0x1A3160 which subtracts 1 from width and height before calling QPainter::drawRects
+// with Qt::NoPen. At 100% scaling this happens to align, but at fractional High-DPI
+// (e.g. 125%, 150%) the 1-logical-pixel reduction leaves a 1px unpainted gap at the
+// right/bottom edges of filled UI rects. Restore full width/height and use fillRect.
 static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     if (g_scale > 1.001 && painter && rects && count == 1 && g_painter_fill_rect && g_painter_brush) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
@@ -378,6 +418,10 @@ static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     g_orig_draw_rects(painter, rects, count);
 }
 
+// Modo calls QPainter::setWindow(0, 0, logical_w, logical_h) when initializing a
+// QPainter on an OPAL QImage. Because Qt's default viewport on a DPR-scaled QImage
+// is already (physical_w / dpr) == logical_w, passing logical_w to setWindow would
+// apply DPR scaling a second time unless setWindow is given physical dimensions.
 static void HookPainterSetWindow(void* painter, int x, int y, int w, int h) {
     if (g_scale > 1.001 && painter && g_painter_device && g_qpd_get_dpr) {
         void* dev = g_painter_device(painter);
@@ -389,6 +433,9 @@ static void HookPainterSetWindow(void* painter, int x, int y, int w, int h) {
     g_orig_set_window(painter, x, y, w, h);
 }
 
+// Modo explicitly sets QFont::NoAntialias (0x100) on UI fonts, which produces
+// jagged bitmap-like glyphs on High-DPI displays. Upgrade 0x100 to
+// QFont::PreferAntialias (0x80) when High-DPI scaling is active.
 static void HookFontSetStyleStrategy(void* font_ptr, int strategy) {
     if (g_scale > 1.001 && strategy == 0x100) {
         // Replace QFont::NoAntialias (0x100) with QFont::PreferAntialias (0x80) at High-DPI
@@ -520,6 +567,24 @@ static void InstallAllHooks() {
             PatchSlot(s_draw_rects, reinterpret_cast<void*>(&HookDrawRects),            reinterpret_cast<void**>(&g_orig_draw_rects));
             PatchSlot(s_set_win,    reinterpret_cast<void*>(&HookPainterSetWindow),     reinterpret_cast<void**>(&g_orig_set_window));
             PatchSlot(s_font_style, reinterpret_cast<void*>(&HookFontSetStyleStrategy), reinterpret_cast<void**>(&g_orig_font_style));
+        }
+
+        // Prevent LUXQtWidget::paintEvent (front3000.dll+0x1724A0) from synchronously calling
+        // FireLazyHandlers(3, nullptr) at 0x1724C3 (before setting m_inPaintEvent = 1 at 0x1724C8).
+        // Under High-DPI (e.g. QT_SCALE_FACTOR=1.25), if a lazy form layout handler resizes a
+        // widget mid-paint, Qt reallocates the window's QBackingStore QImage and frees the
+        // QPaintEngine* cached on the stack by QWidgetPrivate::drawWidget (Qt5Widgets.dll+0x376C5),
+        // causing a Use-After-Free Access Violation (0xC0000005) at Qt5Widgets.dll+0x37B99 upon return.
+        // Deferred lazy handlers still run safely outside drawWidget via RedrawIdle (0x0590AE),
+        // WObjOpenWithUnusualFlags (0x064399), and the postEvent at the end of paintEvent (0x1727D9).
+        uint8_t* p_paint_lazy = front + 0x1724C3;
+        if (p_paint_lazy[0] == 0xE8 && p_paint_lazy[1] == 0x58 && p_paint_lazy[2] == 0x23 &&
+            p_paint_lazy[3] == 0xED && p_paint_lazy[4] == 0xFF) {
+            DWORD old_prot = 0;
+            if (VirtualProtect(p_paint_lazy, 5, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                for (int i = 0; i < 5; ++i) p_paint_lazy[i] = 0x90;
+                VirtualProtect(p_paint_lazy, 5, old_prot, &old_prot);
+            }
         }
 
         g_hooked = true;
