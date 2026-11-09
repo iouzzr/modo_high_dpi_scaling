@@ -15,6 +15,7 @@ add_library(high_dpi_scaling SHARED
 set_target_properties(high_dpi_scaling PROPERTIES
     OUTPUT_NAME "high_dpi_scaling"
     PREFIX ""
+    MSVC_RUNTIME_LIBRARY "MultiThreaded"
 )
 
 if(MSVC)
