@@ -369,14 +369,13 @@ def bootstrap():
 
     child_env["QT_ENABLE_HIGHDPI_SCALING"] = "0"
     child_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    child_env["QT_FONT_DPI"] = "96"
 
     if effective_scale > 1.001:
         scale_str = str(int(effective_scale)) if effective_scale == int(effective_scale) else str(effective_scale)
         child_env["QT_SCALE_FACTOR"] = scale_str
-        child_env["QT_FONT_DPI"] = "96"
     else:
         child_env["QT_SCALE_FACTOR"] = "1"
-        child_env.pop("QT_FONT_DPI", None)
 
     child_env["MODO_HIDPI_CHILD"] = "1"
 
