@@ -38,7 +38,7 @@ This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI 
    - Download `high_dpi_scaling.zip` from the [latest release](../../releases/latest).
    - Open your Modo `Kits` folder at `%APPDATA%\Luxology\Kits` (or find it from Modo via **`System -> Open User Folder`** -> `Kits`).
    - **Make sure Modo is closed**, and delete the existing `high_dpi_scaling` folder if an older version is installed.
-   - Extract `high_dpi_scaling.zip` and copy the `high_dpi_scaling` folder into `Kits`.
+   - Extract `high_dpi_scaling.zip` and copy the `high_dpi_scaling` folder (the one containing `index.cfg`) into `Kits`.
    > **Note**: The `.lpk` installer in Modo 16 & 17 has a bug that prevents updating in-use `.dll` files. To avoid this issue, releases are currently provided in `.zip` format instead of `.lpk`.
 2. **Default Behavior**: By default, `Scaling Mode` is set to **`Use System Setting`**, which automatically follows your Windows display scaling. In most cases, no further configuration is needed.
 3. **Customizing Scaling**: To manually change the scaling factor or disable scaling, go to **`System -> Preferences -> Defaults -> UI -> Interface Scaling`** (restart Modo after changing settings to take effect):
