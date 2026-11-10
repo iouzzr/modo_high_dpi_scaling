@@ -1,5 +1,7 @@
 # python
-# -*- coding: utf-8 -*-
+# Copyright 2026 iouzzr
+# SPDX-License-Identifier: Apache-2.0
+#
 # HighDPIScaling lxserv plugin for Foundry Modo (16.x & 17.x)
 # 1. Pre-window bootstrapper (__COMPAT_LAYER=HighDpiAware, QT_SCALE_FACTOR, QT_FONT_DPI)
 #    and early OpenGL FBO/Viewport + 2D UI hook installer.

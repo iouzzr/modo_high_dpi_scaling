@@ -1,3 +1,6 @@
+// Copyright 2026 iouzzr
+// SPDX-License-Identifier: Apache-2.0
+
 // high_dpi_scaling.cpp - High-DPI 3D Viewport & 2D UI (OPALDisp) Patch DLL for Foundry Modo (16.x & 17.x)
 // Hooks QOpenGLFramebufferObject, AGLViewport / AGLScissor, and QImage / QPaintDevice / QPainter / QFont
 // across Modo 16 (front3000.dll + frame3000.dll + Qt5Gui.dll) and Modo 17 (modo.exe + Qt6Gui.dll + Qt6OpenGL.dll)
