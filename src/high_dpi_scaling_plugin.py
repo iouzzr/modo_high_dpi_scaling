@@ -1,11 +1,11 @@
 # python
 # -*- coding: utf-8 -*-
-# HighDPIScaling lxserv plugin for Foundry Modo
+# HighDPIScaling lxserv plugin for Foundry Modo (16.x & 17.x)
 # 1. Pre-window bootstrapper (__COMPAT_LAYER=HighDpiAware, QT_SCALE_FACTOR, QT_FONT_DPI)
-#    and early OpenGL FBO/Viewport IAT hook installer.
+#    and early OpenGL FBO/Viewport + 2D UI hook installer.
 # 2. Native Modo Commands (high_dpi_scaling.mode, high_dpi_scaling.custom_scale),
 #    Notifier (high_dpi_scaling.notifier), and official lx.service.Persistence()
-#    storage (MODO16.1.CFG\HighDPIScaling.cfg).
+#    storage (HighDPIScaling.cfg).
 import os
 import ctypes
 import subprocess
@@ -26,7 +26,6 @@ SCALE_OPTIONS = (
     ("200%", 2.0),
 )
 SCALE_BY_LABEL = {label: val for label, val in SCALE_OPTIONS}
-LABEL_BY_SCALE = {val: label for label, val in SCALE_OPTIONS}
 
 NOTIFIER_NAME = "high_dpi_scaling.notifier"
 CMD_MODE_NAME = "high_dpi_scaling.mode"

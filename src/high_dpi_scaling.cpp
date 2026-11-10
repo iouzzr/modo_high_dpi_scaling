@@ -1,7 +1,7 @@
-// high_dpi_scaling.cpp - High-DPI 3D Viewport & 2D UI (OPALDisp) Patch DLL for Foundry Modo
-// Hooks QOpenGLFramebufferObject (in front3000.dll), AGLViewport / AGLScissor (in frame3000.dll),
-// and QImage / QPaintDevice / QPainter / QFont (in front3000.dll) to render both 3D viewports
-// and 2D UI panels/text at native High-DPI physical resolution (125%, 150%, 200%, etc.).
+// high_dpi_scaling.cpp - High-DPI 3D Viewport & 2D UI (OPALDisp) Patch DLL for Foundry Modo (16.x & 17.x)
+// Hooks QOpenGLFramebufferObject, AGLViewport / AGLScissor, and QImage / QPaintDevice / QPainter / QFont
+// across Modo 16 (front3000.dll + frame3000.dll + Qt5Gui.dll) and Modo 17 (modo.exe + Qt6Gui.dll + Qt6OpenGL.dll)
+// to render both 3D viewports and 2D UI panels/text at native High-DPI physical resolution.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -41,6 +41,8 @@ typedef void           (*FnDrawImageXY)(void* painter, int x, int y, const void*
 typedef void           (*FnDrawRects)(void* painter, const QRectC* rects, int count);
 typedef void           (*FnDrawLines)(void* painter, const QRectC* lines, int count);
 typedef void           (*FnDrawPoints)(void* painter, const QSizeC* points, int count);
+typedef void           (*FnDrawLine4)(void* painter, int x1, int y1, int x2, int y2);
+typedef void           (*FnDrawPoint2)(void* painter, int x, int y);
 typedef void           (*FnFillRectBrush)(void* painter, const QRectC* rect, const void* brush);
 typedef const void*    (*FnPainterBrush)(const void* painter);
 typedef void           (*FnPainterSetWindow)(void* painter, int x, int y, int w, int h);
@@ -55,6 +57,7 @@ static FnDim                  g_orig_fbo_height      = nullptr;
 static FnFboBlit              g_orig_fbo_blit        = nullptr;
 static FnRect4                g_orig_viewport        = nullptr;
 static FnRect4                g_orig_scissor         = nullptr;
+static void***                g_agl_table            = nullptr;
 
 static FnQImageCtorSize       g_orig_qimg_ctor_size  = nullptr;
 static FnQImageCtorWH         g_orig_qimg_ctor_wh    = nullptr;
@@ -72,6 +75,8 @@ static FnDrawImageXY          g_orig_draw_image_xy   = nullptr;
 static FnDrawRects            g_orig_draw_rects      = nullptr;
 static FnDrawLines            g_orig_draw_lines      = nullptr;
 static FnDrawPoints           g_orig_draw_points     = nullptr;
+static FnDrawLine4            g_orig_draw_line4      = nullptr;
+static FnDrawPoint2           g_orig_draw_point2     = nullptr;
 static FnFillRectBrush        g_painter_fill_rect    = nullptr;
 static FnPainterBrush         g_painter_brush        = nullptr;
 static FnPainterSetWindow     g_orig_set_window      = nullptr;
@@ -82,7 +87,8 @@ static FnSetDpr               g_qimg_set_dpr         = nullptr;
 static FnGetDpr               g_qimg_get_dpr         = nullptr;
 static FnGetDpr               g_qpd_get_dpr          = nullptr;
 
-static uint8_t*               g_front_base           = nullptr;
+static const uint8_t*         g_ret_rot_ccw          = nullptr;
+static const uint8_t*         g_ret_rot_cw           = nullptr;
 static double                 g_scale                = 1.0;
 static bool                   g_hooked               = false;
 
@@ -185,11 +191,19 @@ static void HookFboBlit(void* target, const QRectC* tr, void* source, const QRec
 }
 
 static void HookViewport(int x, int y, int w, int h) {
-    g_orig_viewport(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    if (g_orig_viewport) {
+        g_orig_viewport(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    } else if (g_agl_table && *g_agl_table) {
+        reinterpret_cast<FnRect4>((*g_agl_table)[0xF0 / 8])(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    }
 }
 
 static void HookScissor(int x, int y, int w, int h) {
-    g_orig_scissor(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    if (g_orig_scissor) {
+        g_orig_scissor(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    } else if (g_agl_table && *g_agl_table) {
+        reinterpret_cast<FnRect4>((*g_agl_table)[0x460 / 8])(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
+    }
 }
 
 // ============================================================================
@@ -220,11 +234,9 @@ static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
 static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
     if (g_scale > 1.001 && fmt == 5 && g_qimg_set_dpr) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
-        // Check if called from ORastCreate (0x1801B60D0 -> ret at 0x1801B60D6)
-        bool is_orast = (g_front_base && ret == g_front_base + 0x1B60D6) ||
-                        (ret && ret[0] == 0x48 && ret[1] == 0x8D && ret[2] == 0x05 &&
-                         ret[7] == 0x48 && ret[8] == 0x89 && ret[9] == 0x07);
-        if (is_orast) {
+        // Verify return site in ORastCreate: lea rax, [rip+disp32]; mov [rdi], rax
+        if (ret && ret[0] == 0x48 && ret[1] == 0x8D && ret[2] == 0x05 &&
+            ret[7] == 0x48 && ret[8] == 0x89 && ret[9] == 0x07) {
             void* res = g_orig_qimg_ctor_wh(this_ptr, ScaleInt(w), ScaleInt(h), fmt);
             g_qimg_set_dpr(this_ptr, g_scale);
             return res;
@@ -266,16 +278,18 @@ static int HookQImageHeight(const void* this_ptr) {
     if (g_scale > 1.001 && g_qimg_get_dpr && g_qimg_get_dpr(this_ptr) > 1.001) {
         int lh = UnscaleInt(ph);
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
-        // Check if called at start of QImageToILxImage (0x1801A29E0 -> ret at 0x1801A29FB)
-        if (g_front_base && ret == g_front_base + 0x1A29FB && g_orig_qimg_width && g_orig_qimg_pixel) {
+        // Verify return site at start of QImageToILxImage: mov rcx, rsi; mov ebx, eax; call QImage::width
+        bool is_q2i = ret && ret[0] == 0x48 && ret[1] == 0x8B && ret[2] == 0xCE &&
+                      ret[3] == 0x8B && ret[4] == 0xD8 && ret[5] == 0xFF && ret[6] == 0x15;
+        if (is_q2i && g_orig_qimg_width && g_orig_qimg_pixel) {
             const uint8_t* const* stack = reinterpret_cast<const uint8_t* const*>(_AddressOfReturnAddress());
-            int rot_mode = 0; // 1 = 90 deg CCW (0x1801F6C0D), 2 = 90 deg CW (0x18019733C)
+            int rot_mode = 0; // 1 = 90 deg CCW, 2 = 90 deg CW
             for (int i = 1; i <= 20; ++i) {
-                if (stack[i] == g_front_base + 0x1F6C12) {
+                if (g_ret_rot_ccw && stack[i] == g_ret_rot_ccw) {
                     rot_mode = 1;
                     break;
                 }
-                if (stack[i] == g_front_base + 0x197341) {
+                if (g_ret_rot_cw && stack[i] == g_ret_rot_cw) {
                     rot_mode = 2;
                     break;
                 }
@@ -407,44 +421,45 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
 // adjacent logical cells k and k+1 share the exact half-open physical interval
 // [round(k * g_scale), round((k + 1) * g_scale)) with zero 1px gaps or overlaps.
 
-// OPALDisp::FillRect (front3000.dll+0x1B503B, ret +0x1B5041) subtracts 1 from
-// width/height via 0x1A3160 before calling drawRects with Qt::NoPen. Restore +1.
+// OPALDisp::FillRect subtracts 1 from width/height before calling drawRects with Qt::NoPen. Restore +1.
 static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     if (g_scale > 1.001 && painter && rects && count == 1 && g_painter_fill_rect && g_painter_brush) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
-        // Check if called from OPALDisp::FillRect (0x1801B503B -> ret at 0x1801B5041),
-        // where 0x1801A3160 subtracted 1 from width and height before calling drawRects.
-        if (g_front_base && ret == g_front_base + 0x1B5041) {
+        // Verify return site in OPALDisp::FillRect: lea rcx, [rsp+38h]
+        if (ret && ret[0] == 0x48 && ret[1] == 0x8D && ret[2] == 0x4C && ret[3] == 0x24 && ret[4] == 0x38) {
             QRectC full_rect = { rects[0].x1, rects[0].y1, rects[0].x2 + 1, rects[0].y2 + 1 };
-            const void* br = g_painter_brush(painter);
-            g_painter_fill_rect(painter, &full_rect, br);
+            g_painter_fill_rect(painter, &full_rect, g_painter_brush(painter));
             return;
         }
     }
     g_orig_draw_rects(painter, rects, count);
 }
 
-// OPALDisp::DrawLine (front3000.dll+0x1B517F, ret +0x1B5185) sets QBrush(color) and
-// a 1-physical-pixel cosmetic QPen (width=0) via 0x1B6140. Convert axis-aligned
-// lines to 1-logical-pixel fillRects to prevent 1px unpainted gaps next to FillRects.
+// OPALDisp::DrawLine sets QBrush(color) and a 1-physical-pixel cosmetic QPen (width=0).
+// Convert axis-aligned lines to 1-logical-pixel fillRects to prevent 1px unpainted gaps.
+static bool TryFillAxisLine(void* painter, int x1, int y1, int x2, int y2) {
+    if (y1 == y2) {
+        int lx1 = (x1 <= x2) ? x1 : x2;
+        int lx2 = (x1 <= x2) ? x2 : x1;
+        QRectC full_rect = { lx1, y1, lx2, y1 };
+        g_painter_fill_rect(painter, &full_rect, g_painter_brush(painter));
+        return true;
+    }
+    if (x1 == x2) {
+        int ly1 = (y1 <= y2) ? y1 : y2;
+        int ly2 = (y1 <= y2) ? y2 : y1;
+        QRectC full_rect = { x1, ly1, x1, ly2 };
+        g_painter_fill_rect(painter, &full_rect, g_painter_brush(painter));
+        return true;
+    }
+    return false;
+}
+
 static void HookDrawLines(void* painter, const QRectC* lines, int count) {
     if (g_scale > 1.001 && painter && lines && count == 1 && g_painter_fill_rect && g_painter_brush) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
-        if (g_front_base && ret == g_front_base + 0x1B5185) {
-            if (lines[0].y1 == lines[0].y2) {
-                int x1 = (lines[0].x1 <= lines[0].x2) ? lines[0].x1 : lines[0].x2;
-                int x2 = (lines[0].x1 <= lines[0].x2) ? lines[0].x2 : lines[0].x1;
-                QRectC full_rect = { x1, lines[0].y1, x2, lines[0].y1 };
-                const void* br = g_painter_brush(painter);
-                g_painter_fill_rect(painter, &full_rect, br);
-                return;
-            }
-            if (lines[0].x1 == lines[0].x2) {
-                int y1 = (lines[0].y1 <= lines[0].y2) ? lines[0].y1 : lines[0].y2;
-                int y2 = (lines[0].y1 <= lines[0].y2) ? lines[0].y2 : lines[0].y1;
-                QRectC full_rect = { lines[0].x1, y1, lines[0].x1, y2 };
-                const void* br = g_painter_brush(painter);
-                g_painter_fill_rect(painter, &full_rect, br);
+        if (ret && ret[0] == 0x48 && ret[1] == 0x8B && ret[2] == 0x4B && ret[3] == 0x18) {
+            if (TryFillAxisLine(painter, lines[0].x1, lines[0].y1, lines[0].x2, lines[0].y2)) {
                 return;
             }
         }
@@ -452,20 +467,36 @@ static void HookDrawLines(void* painter, const QRectC* lines, int count) {
     g_orig_draw_lines(painter, lines, count);
 }
 
-// OPALDisp::DrawPoint (front3000.dll+0x1B52BC, ret +0x1B52C2) uses a 1-physical-pixel
-// cosmetic pen to erase square FillRect corners and draw checkmarks/arrows. Convert
-// to a 1x1 logical cell fillRect so corner erasing covers the full scaled cell.
+static void HookDrawLine4(void* painter, int x1, int y1, int x2, int y2) {
+    if (g_scale > 1.001 && painter && g_painter_fill_rect && g_painter_brush) {
+        if (TryFillAxisLine(painter, x1, y1, x2, y2)) {
+            return;
+        }
+    }
+    g_orig_draw_line4(painter, x1, y1, x2, y2);
+}
+
+// OPALDisp::DrawPoint uses a 1-physical-pixel cosmetic pen to erase square FillRect
+// corners and draw checkmarks/arrows. Convert to a 1x1 logical cell fillRect.
 static void HookDrawPoints(void* painter, const QSizeC* points, int count) {
     if (g_scale > 1.001 && painter && points && count == 1 && g_painter_fill_rect && g_painter_brush) {
         const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
-        if (g_front_base && ret == g_front_base + 0x1B52C2) {
+        if (ret && ret[0] == 0xC7 && ret[1] == 0x44 && ret[2] == 0x24 && ret[3] == 0x20) {
             QRectC full_rect = { points[0].w, points[0].h, points[0].w, points[0].h };
-            const void* br = g_painter_brush(painter);
-            g_painter_fill_rect(painter, &full_rect, br);
+            g_painter_fill_rect(painter, &full_rect, g_painter_brush(painter));
             return;
         }
     }
     g_orig_draw_points(painter, points, count);
+}
+
+static void HookDrawPoint2(void* painter, int x, int y) {
+    if (g_scale > 1.001 && painter && g_painter_fill_rect && g_painter_brush) {
+        QRectC full_rect = { x, y, x, y };
+        g_painter_fill_rect(painter, &full_rect, g_painter_brush(painter));
+        return;
+    }
+    g_orig_draw_point2(painter, x, y);
 }
 
 // Modo calls QPainter::setWindow(0, 0, logical_w, logical_h) when initializing a
@@ -552,23 +583,69 @@ static void PatchSlot(void** slot, void* new_fn, void** out_orig) {
     }
 }
 
+static bool MatchPattern(const uint8_t* p, const uint8_t* pat, const char* mask, size_t len) {
+    for (size_t j = 0; j < len; ++j) {
+        if (mask[j] == 'x' && p[j] != pat[j]) return false;
+    }
+    return true;
+}
+
+static uint8_t* FindCodePattern(uint8_t* base, size_t hint_rva, const uint8_t* pat, const char* mask, size_t len) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    uint8_t* start = base + sec[0].VirtualAddress;
+    size_t size = sec[0].Misc.VirtualSize;
+    if (size < len) return nullptr;
+    if (hint_rva >= sec[0].VirtualAddress && hint_rva + len <= sec[0].VirtualAddress + size) {
+        if (MatchPattern(base + hint_rva, pat, mask, len)) {
+            return base + hint_rva;
+        }
+    }
+    for (size_t i = 0; i <= size - len; ++i) {
+        if (MatchPattern(start + i, pat, mask, len)) return start + i;
+    }
+    return nullptr;
+}
+
+static void PatchJump14(uint8_t* target, void* dst_fn) {
+    DWORD old_prot = 0;
+    if (VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &old_prot)) {
+        target[0] = 0xFF;
+        target[1] = 0x25;
+        *reinterpret_cast<uint32_t*>(target + 2) = 0;
+        *reinterpret_cast<void**>(target + 6) = dst_fn;
+        VirtualProtect(target, 14, old_prot, &old_prot);
+        FlushInstructionCache(GetCurrentProcess(), target, 14);
+    }
+}
+
 static void InstallAllHooks() {
     if (g_hooked) return;
 
+    // Modo 16 splits UI/GL into front3000.dll + frame3000.dll + Qt5Gui.dll;
+    // Modo 17 statically links front/frame into modo.exe and uses Qt6Gui.dll.
     auto* front = reinterpret_cast<uint8_t*>(GetModuleHandleA("front3000.dll"));
+    if (!front) front = reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr));
     auto* frame = reinterpret_cast<uint8_t*>(GetModuleHandleA("frame3000.dll"));
-    HMODULE qt5gui = GetModuleHandleA("Qt5Gui.dll");
-    if (!front || !frame || !qt5gui) return;
+    if (!frame) frame = front;
+    HMODULE qtgui = GetModuleHandleA("Qt5Gui.dll");
+    if (!qtgui) qtgui = GetModuleHandleA("Qt6Gui.dll");
+    if (!front || !frame || !qtgui) return;
 
-    g_front_base        = front;
-    g_qimg_set_dpr      = reinterpret_cast<FnSetDpr>(GetProcAddress(qt5gui, "?setDevicePixelRatio@QImage@@QEAAXN@Z"));
-    g_qimg_get_dpr      = reinterpret_cast<FnGetDpr>(GetProcAddress(qt5gui, "?devicePixelRatio@QImage@@QEBANXZ"));
-    g_qpd_get_dpr       = reinterpret_cast<FnGetDpr>(GetProcAddress(qt5gui, "?devicePixelRatioF@QPaintDevice@@QEBANXZ"));
-    g_painter_device    = reinterpret_cast<FnPainterDevice>(GetProcAddress(qt5gui, "?device@QPainter@@QEBAPEAVQPaintDevice@@XZ"));
-    g_painter_fill_rect = reinterpret_cast<FnFillRectBrush>(GetProcAddress(qt5gui, "?fillRect@QPainter@@QEAAXAEBVQRect@@AEBVQBrush@@@Z"));
-    g_painter_brush     = reinterpret_cast<FnPainterBrush>(GetProcAddress(qt5gui, "?brush@QPainter@@QEBAAEBVQBrush@@XZ"));
-    g_qimg_dtor         = reinterpret_cast<FnQImageDtor>(GetProcAddress(qt5gui, "??1QImage@@UEAA@XZ"));
-    g_qimg_scanline     = reinterpret_cast<FnQImageScanLine>(GetProcAddress(qt5gui, "?scanLine@QImage@@QEAAPEAEH@Z"));
+    g_qimg_set_dpr      = reinterpret_cast<FnSetDpr>(GetProcAddress(qtgui, "?setDevicePixelRatio@QImage@@QEAAXN@Z"));
+    g_qimg_get_dpr      = reinterpret_cast<FnGetDpr>(GetProcAddress(qtgui, "?devicePixelRatio@QImage@@QEBANXZ"));
+    g_qpd_get_dpr       = reinterpret_cast<FnGetDpr>(GetProcAddress(qtgui, "?devicePixelRatioF@QPaintDevice@@QEBANXZ"));
+    if (!g_qpd_get_dpr) {
+        g_qpd_get_dpr   = reinterpret_cast<FnGetDpr>(GetProcAddress(qtgui, "?devicePixelRatio@QPaintDevice@@QEBANXZ"));
+    }
+    g_painter_device    = reinterpret_cast<FnPainterDevice>(GetProcAddress(qtgui, "?device@QPainter@@QEBAPEAVQPaintDevice@@XZ"));
+    g_painter_fill_rect = reinterpret_cast<FnFillRectBrush>(GetProcAddress(qtgui, "?fillRect@QPainter@@QEAAXAEBVQRect@@AEBVQBrush@@@Z"));
+    g_painter_brush     = reinterpret_cast<FnPainterBrush>(GetProcAddress(qtgui, "?brush@QPainter@@QEBAAEBVQBrush@@XZ"));
+    g_qimg_dtor         = reinterpret_cast<FnQImageDtor>(GetProcAddress(qtgui, "??1QImage@@UEAA@XZ"));
+    g_qimg_scanline     = reinterpret_cast<FnQImageScanLine>(GetProcAddress(qtgui, "?scanLine@QImage@@QEAAPEAEH@Z"));
 
     // 1. 3D OpenGL Viewport IAT slots
     void** s_fbo_ctor   = FindIATSlot(front, "??0QOpenGLFramebufferObject@@QEAA@HHAEBVQOpenGLFramebufferObjectFormat@@@Z");
@@ -577,6 +654,17 @@ static void InstallAllHooks() {
     void** s_fbo_blit   = FindIATSlot(front, "?blitFramebuffer@QOpenGLFramebufferObject@@SAXPEAV1@AEBVQRect@@01II@Z");
     void** s_vp         = FindIATSlot(frame, "?AGLViewport@@YAXHHHH@Z");
     void** s_sc         = FindIATSlot(frame, "?AGLScissor@@YAXHHHH@Z");
+
+    // In Modo 17 (merged modo.exe), AGLViewport and AGLScissor are internal 14-byte
+    // dispatch thunks: mov rax, [rip+disp32]; jmp qword ptr [rax + 0xF0 / 0x460].
+    uint8_t* p_agl_vp = nullptr;
+    uint8_t* p_agl_sc = nullptr;
+    if (!s_vp || !s_sc) {
+        static const uint8_t pat_vp[14] = { 0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0xFF, 0xA0, 0xF0, 0x00, 0x00, 0x00 };
+        static const uint8_t pat_sc[14] = { 0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0xFF, 0xA0, 0x60, 0x04, 0x00, 0x00 };
+        p_agl_vp = FindCodePattern(front, 0xD45F60, pat_vp, "xxx????xxxxxxx", 14);
+        p_agl_sc = FindCodePattern(front, 0xD370A0, pat_sc, "xxx????xxxxxxx", 14);
+    }
 
     // 2. 2D UI (OPALDisp) IAT slots
     void** s_qimg_csize = FindIATSlot(front, "??0QImage@@QEAA@AEBVQSize@@W4Format@0@@Z");
@@ -593,16 +681,25 @@ static void InstallAllHooks() {
     void** s_draw_rects = FindIATSlot(front, "?drawRects@QPainter@@QEAAXPEBVQRect@@H@Z");
     void** s_draw_lines = FindIATSlot(front, "?drawLines@QPainter@@QEAAXPEBVQLine@@H@Z");
     void** s_draw_pts   = FindIATSlot(front, "?drawPoints@QPainter@@QEAAXPEBVQPoint@@H@Z");
+    void** s_draw_line4 = FindIATSlot(front, "?drawLine@QPainter@@QEAAXHHHH@Z");
+    void** s_draw_pt2   = FindIATSlot(front, "?drawPoint@QPainter@@QEAAXHH@Z");
     void** s_set_win    = FindIATSlot(front, "?setWindow@QPainter@@QEAAXHHHH@Z");
     void** s_font_style = FindIATSlot(front, "?setStyleStrategy@QFont@@QEAAXW4StyleStrategy@1@@Z");
 
-    if (s_fbo_ctor && s_fbo_width && s_fbo_height && s_fbo_blit && s_vp && s_sc) {
+    if (s_fbo_ctor && s_fbo_width && s_fbo_height && s_fbo_blit && ((s_vp && s_sc) || (p_agl_vp && p_agl_sc))) {
         PatchSlot(s_fbo_ctor,   reinterpret_cast<void*>(&HookFboCtor),   reinterpret_cast<void**>(&g_orig_fbo_ctor));
         PatchSlot(s_fbo_width,  reinterpret_cast<void*>(&HookFboWidth),  reinterpret_cast<void**>(&g_orig_fbo_width));
         PatchSlot(s_fbo_height, reinterpret_cast<void*>(&HookFboHeight), reinterpret_cast<void**>(&g_orig_fbo_height));
         PatchSlot(s_fbo_blit,   reinterpret_cast<void*>(&HookFboBlit),   reinterpret_cast<void**>(&g_orig_fbo_blit));
-        PatchSlot(s_vp,         reinterpret_cast<void*>(&HookViewport),  reinterpret_cast<void**>(&g_orig_viewport));
-        PatchSlot(s_sc,         reinterpret_cast<void*>(&HookScissor),   reinterpret_cast<void**>(&g_orig_scissor));
+        if (s_vp && s_sc) {
+            PatchSlot(s_vp,     reinterpret_cast<void*>(&HookViewport),  reinterpret_cast<void**>(&g_orig_viewport));
+            PatchSlot(s_sc,     reinterpret_cast<void*>(&HookScissor),   reinterpret_cast<void**>(&g_orig_scissor));
+        } else {
+            int32_t disp = *reinterpret_cast<int32_t*>(p_agl_vp + 3);
+            g_agl_table = reinterpret_cast<void***>(p_agl_vp + 7 + disp);
+            PatchJump14(p_agl_vp, reinterpret_cast<void*>(&HookViewport));
+            PatchJump14(p_agl_sc, reinterpret_cast<void*>(&HookScissor));
+        }
 
         if (g_qimg_set_dpr && g_qimg_get_dpr && g_qpd_get_dpr) {
             PatchSlot(s_qimg_csize, reinterpret_cast<void*>(&HookQImageCtorSize),       reinterpret_cast<void**>(&g_orig_qimg_ctor_size));
@@ -619,25 +716,42 @@ static void InstallAllHooks() {
             PatchSlot(s_draw_rects, reinterpret_cast<void*>(&HookDrawRects),            reinterpret_cast<void**>(&g_orig_draw_rects));
             PatchSlot(s_draw_lines, reinterpret_cast<void*>(&HookDrawLines),            reinterpret_cast<void**>(&g_orig_draw_lines));
             PatchSlot(s_draw_pts,   reinterpret_cast<void*>(&HookDrawPoints),           reinterpret_cast<void**>(&g_orig_draw_points));
+            PatchSlot(s_draw_line4, reinterpret_cast<void*>(&HookDrawLine4),            reinterpret_cast<void**>(&g_orig_draw_line4));
+            PatchSlot(s_draw_pt2,   reinterpret_cast<void*>(&HookDrawPoint2),           reinterpret_cast<void**>(&g_orig_draw_point2));
             PatchSlot(s_set_win,    reinterpret_cast<void*>(&HookPainterSetWindow),     reinterpret_cast<void**>(&g_orig_set_window));
             PatchSlot(s_font_style, reinterpret_cast<void*>(&HookFontSetStyleStrategy), reinterpret_cast<void**>(&g_orig_font_style));
         }
 
-        // Prevent LUXQtWidget::paintEvent (front3000.dll+0x1724A0) from synchronously calling
-        // FireLazyHandlers(3, nullptr) at 0x1724C3 (before setting m_inPaintEvent = 1 at 0x1724C8).
-        // Under High-DPI (e.g. QT_SCALE_FACTOR=1.25), if a lazy form layout handler resizes a
-        // widget mid-paint, Qt reallocates the window's QBackingStore QImage and frees the
-        // QPaintEngine* cached on the stack by QWidgetPrivate::drawWidget (Qt5Widgets.dll+0x376C5),
-        // causing a Use-After-Free Access Violation (0xC0000005) at Qt5Widgets.dll+0x37B99 upon return.
-        // Deferred lazy handlers still run safely outside drawWidget via RedrawIdle (0x0590AE),
-        // WObjOpenWithUnusualFlags (0x064399), and the postEvent at the end of paintEvent (0x1727D9).
-        uint8_t* p_paint_lazy = front + 0x1724C3;
-        if (p_paint_lazy[0] == 0xE8 && p_paint_lazy[1] == 0x58 && p_paint_lazy[2] == 0x23 &&
-            p_paint_lazy[3] == 0xED && p_paint_lazy[4] == 0xFF) {
+        // Locate rotated vertical tab strip callers (90 deg CCW and CW) once at startup.
+        static const uint8_t pat_ccw[21] = {
+            0x48, 0x8B, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
+            0x4C, 0x8B, 0xC0, 0x48, 0x8D, 0x15, 0, 0
+        };
+        static const uint8_t pat_cw[17] = {
+            0xE8, 0, 0, 0, 0, 0x44, 0x8B, 0x43, 0x50, 0xB9, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x53, 0x4C
+        };
+        uint8_t* p_ccw = FindCodePattern(front, (s_vp && s_sc) ? 0x1F6C05 : 0xD0EE45, pat_ccw, "xxxxxxxxx????xxxxxx??", 21);
+        uint8_t* p_cw  = FindCodePattern(front, (s_vp && s_sc) ? 0x19733C : 0xCF0683, pat_cw,  "x????xxxxxxxxxxxx", 17);
+        if (p_ccw) g_ret_rot_ccw = p_ccw + 13;
+        if (p_cw)  g_ret_rot_cw  = p_cw + 5;
+
+        // Prevent LUXQtWidget::paintEvent (Modo 16 +0x1724A0, Modo 17 +0xD70770) from synchronously
+        // calling FireLazyHandlers(3, nullptr) before setting m_inPaintEvent = 1.
+        // Under High-DPI, if a lazy form layout handler resizes a widget mid-paint, Qt reallocates
+        // the window's QBackingStore QImage and frees the QPaintEngine* cached on the stack by
+        // QWidgetPrivate::drawWidget, causing a Use-After-Free Access Violation upon return.
+        static const uint8_t pat_lazy16[15] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0x41, 0xC6, 0x46, 0x40, 0x01 };
+        static const uint8_t pat_lazy17[14] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0xC6, 0x47, 0x38, 0x01 };
+        uint8_t* p_lazy = (s_vp && s_sc)
+            ? FindCodePattern(front, 0x1724BE, pat_lazy16, "xxxxxx????xxxxx", 15)
+            : FindCodePattern(front, 0xD7078C, pat_lazy17, "xxxxxx????xxxx", 14);
+        if (p_lazy) {
+            uint8_t* p_call = p_lazy + 5;
             DWORD old_prot = 0;
-            if (VirtualProtect(p_paint_lazy, 5, PAGE_EXECUTE_READWRITE, &old_prot)) {
-                for (int i = 0; i < 5; ++i) p_paint_lazy[i] = 0x90;
-                VirtualProtect(p_paint_lazy, 5, old_prot, &old_prot);
+            if (VirtualProtect(p_call, 5, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                for (int i = 0; i < 5; ++i) p_call[i] = 0x90;
+                VirtualProtect(p_call, 5, old_prot, &old_prot);
+                FlushInstructionCache(GetCurrentProcess(), p_call, 5);
             }
         }
 
