@@ -1,9 +1,8 @@
 # Foundry Modo High-DPI Scaling Kit (`high_dpi_scaling`)
 
-> **CAUSE**: *"Modo does not currently support 4k / High DPI monitors."*
-> — Foundry Support Q100546: *Scaling Modo for 4k / High DPI monitors on Windows 10/11* ([Archived](https://web.archive.org/web/20260103155957/https://support.foundry.com/hc/en-us/articles/360007725379-Q100546-Scaling-Modo-for-4k-High-DPI-monitors-on-Windows-10-11))
+Modo does not natively support 4K / High-DPI monitors on Windows ([Foundry Support Q100546](https://web.archive.org/web/20260103155957/https://support.foundry.com/hc/en-us/articles/360007725379-Q100546-Scaling-Modo-for-4k-High-DPI-monitors-on-Windows-10-11)). Without display scaling (`100%`), Modo's UI is too small to use comfortably on a 4K / High-DPI screen; however, when Windows display scaling is enabled (e.g., `150%` or `200%`), Modo is scaled by Windows rather than natively by the application—resulting in **low-resolution 3D viewports**, **blurry/pixelated UI text**, and **pixelated icons**.
 
-Because Modo officially lacks native High-DPI support on Windows, Windows renders Modo at low resolution and stretches the entire application window on high-resolution displays—resulting in **low-resolution 3D viewports**, **blurry/pixelated UI text**, and **pixelated icons**. This kit fixes the 3D viewports and UI text by enabling true native High-DPI rendering for **high-resolution 3D OpenGL viewports** and **crisp 2D UI text** in **Foundry Modo 16 & Modo 17** on Windows.
+This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI rendering in **Foundry Modo 16 & Modo 17** on Windows.
 
 ## Comparison (200% Scaling)
 
@@ -35,7 +34,12 @@ Because Modo officially lacks native High-DPI support on Windows, Windows render
 
 ## Installation & Usage
 
-1. Download `high_dpi_scaling.lpk` from the [latest release](../../releases/latest), double-click it (or drag and drop it into Modo) to install, then restart Modo.
+1. **Install / Update**:
+   - Download `high_dpi_scaling.zip` from the [latest release](../../releases/latest).
+   - Open your Modo `Kits` folder at `%APPDATA%\Luxology\Kits` (or find it from Modo via **`System -> Open User Folder`** -> `Kits`).
+   - **Make sure Modo is closed**, and delete the existing `high_dpi_scaling` folder if an older version is installed.
+   - Extract `high_dpi_scaling.zip` and copy the `high_dpi_scaling` folder into `Kits`.
+   > **Note**: The `.lpk` installer in Modo 16 & 17 has a bug that prevents updating in-use `.dll` files. To avoid this issue, releases are currently provided in `.zip` format instead of `.lpk`.
 2. **Default Behavior**: By default, `Scaling Mode` is set to **`Use System Setting`**, which automatically follows your Windows display scaling. In most cases, no further configuration is needed.
 3. **Customizing Scaling**: To manually change the scaling factor or disable scaling, go to **`System -> Preferences -> Defaults -> UI -> Interface Scaling`** (restart Modo after changing settings to take effect):
    - **Scaling Mode**: Choose `Use System Setting`, `Use Custom Scaling`, or `Do Not Scale`.
@@ -51,6 +55,8 @@ Because Modo officially lacks native High-DPI support on Windows, Windows render
 
 ## How It Works
 
+At launch, this plugin sets High-DPI environment variables and uses **runtime API hooking (IAT hooks)** to intercept Modo's internal rendering calls and draw 3D viewports and UI text at native High-DPI resolution:
+
 1. **In-Memory High-DPI Bootstrap**: Because `modo.exe` embeds `<dpiAware>false</dpiAware>` in its manifest and initializes Qt before loading Kits, the `lxserv` Python bootstrapper (`high_dpi_scaling_plugin.py`) reads the saved scaling config, sets `__COMPAT_LAYER=HighDpiAware` and `QT_SCALE_FACTOR` in process memory (without modifying the Windows Registry or `modo.exe` on disk), and relaunches `modo.exe` before any window is created.
 2. **3D OpenGL Viewport Hooks**: Even with Qt High-DPI enabled, Modo's internal 3D viewport pipeline (`front*.dll` / `frame*.dll` / `modo.exe`) allocates `QOpenGLFramebufferObject` surfaces at 1x logical resolution. `high_dpi_scaling.dll` hooks FBO creation, `AGLViewport`, `AGLScissor`, and `blitFramebuffer` to render 3D viewports at full physical pixel resolution while returning logical dimensions to Modo's camera and picking logic.
 3. **2D UI, Text & Vertical Tab Hooks**: Modo's `OPALDisp` 2D engine renders panels and text into 1x offscreen `QImage` buffers with `QFont::NoAntialias`. The DLL hooks offscreen `QImage` allocation to use physical High-DPI dimensions (`devicePixelRatio = scale`), upgrades fonts to `QFont::PreferAntialias`, and intercepts 90° vertical tab rotation so vertical tab text is rotated at native physical resolution instead of a 1x `ILxImage`.
@@ -62,7 +68,7 @@ cmake --preset windows-x64
 cmake --build --preset release
 ```
 
-The built kit and installer package will be generated in `dist/high_dpi_scaling/` and `dist/high_dpi_scaling.lpk`.
+The built kit and archives will be generated in `dist/high_dpi_scaling/`, `dist/high_dpi_scaling.zip`, and `dist/high_dpi_scaling.lpk`.
 
 ## License
 
