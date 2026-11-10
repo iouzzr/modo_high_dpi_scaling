@@ -53,6 +53,9 @@ This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI 
 **Q: What if I previously enabled "Override high DPI scaling behavior" (`modo.exe -> Properties -> Compatibility -> Change high DPI settings -> High DPI scaling override`)?**
 - Whether it is set to `Application`, `System`, or `System (Enhanced)`, this plugin automatically overrides that setting at runtime; however, unchecking it is still recommended for the cleanest setup.
 
+**Q: Why does the Modo 17 splash screen appear twice on startup?**
+- During startup, this plugin automatically restarts Modo with High-DPI environment variables. In Modo 17, the splash screen is displayed before Kits are loaded, so it appears once initially and then reopens after the restart.
+
 ## How It Works
 
 At launch, this plugin sets High-DPI environment variables and uses **runtime API hooking (IAT hooks)** to intercept Modo's internal rendering calls and draw 3D viewports and UI text at native High-DPI resolution:
