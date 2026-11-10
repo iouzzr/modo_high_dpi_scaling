@@ -51,7 +51,7 @@ This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI 
 - Unlike vector text and 3D viewports (which can be rendered natively at any resolution), Modo's built-in icons and 2D widget graphics are fixed low-resolution bitmaps. Applying interpolation filtering (such as bilinear or bicubic smoothing) only blurs their crisp pixel edges without adding real detail, so they are kept unmodified.
 
 **Q: What if I previously enabled "Override high DPI scaling behavior" (`modo.exe -> Properties -> Compatibility -> Change high DPI settings -> High DPI scaling override`)?**
-- You do not need to change it—whether it is set to `Application`, `System`, or `System (Enhanced)`, this plugin automatically overrides that setting at runtime.
+- Whether it is set to `Application`, `System`, or `System (Enhanced)`, this plugin automatically overrides that setting at runtime; however, unchecking it is still recommended for the cleanest setup.
 
 ## How It Works
 
