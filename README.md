@@ -24,7 +24,7 @@ This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI 
 - **Modo**: Foundry Modo 16.x & Modo 17.x
 - **Tested Versions**: Modo 16.1, Modo 17.1
 
-> **Note**: I am not an active Modo user, so testing and feedback from the community are very welcome! If you run into any bugs or edge cases in your workflow, please feel free to open an [issue](../../issues).
+> **Note**: I am not an active Modo user, so any testing or feedback from the community is greatly appreciated! If you run into any bugs or edge cases in your workflow, please feel free to open an [issue](../../issues).
 
 ## Features
 
