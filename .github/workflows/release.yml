@@ -19,12 +19,12 @@ jobs:
       - name: Configure CMake
         run: cmake --preset windows-x64
 
-      - name: Build Release and package LPK
+      - name: Build Release and package archive
         run: cmake --build --preset release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Modo High-DPI Scaling ${{ github.ref_name }}
-          files: dist/high_dpi_scaling.lpk
+          files: dist/high_dpi_scaling.zip
           generate_release_notes: true
