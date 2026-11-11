@@ -1,10 +1,12 @@
 # Foundry Modo High-DPI Scaling Kit (`high_dpi_scaling`)
 
-Modo does not natively support 4K / High-DPI monitors on Windows ([Foundry Support Q100546](https://web.archive.org/web/20260103155957/https://support.foundry.com/hc/en-us/articles/360007725379-Q100546-Scaling-Modo-for-4k-High-DPI-monitors-on-Windows-10-11)). Without display scaling (`100%`), Modo's UI is too small to use comfortably on a 4K / High-DPI screen; however, when Windows display scaling is enabled (e.g., `150%` or `200%`), Modo is scaled by Windows rather than natively by the application—resulting in **low-resolution 3D viewports**, **blurry/pixelated UI text**, and **pixelated icons**.
+Modo does not natively support 4K / High-DPI monitors on Windows ([Foundry Support Q100546](https://web.archive.org/web/20260103155957/https://support.foundry.com/hc/en-us/articles/360007725379-Q100546-Scaling-Modo-for-4k-High-DPI-monitors-on-Windows-10-11)). By default on a High-DPI display (e.g., `150%` or `200%` scaling), Windows detects that `modo.exe` is not DPI-aware and takes over scaling by rendering Modo at low resolution and stretching the entire window—resulting in **low-resolution 3D viewports**, **blurry/pixelated UI text**, and **pixelated icons**. On the other hand, if you set `High DPI scaling override` to `Application` in `modo.exe`'s Compatibility settings to bypass Windows scaling, Modo is left to handle scaling on its own—and because it lacks native High-DPI support, **Modo's UI appears too small to use comfortably on a 4K / High-DPI screen**.
 
 This kit fixes the **3D viewports** and **UI text** by enabling native High-DPI rendering in **Foundry Modo 16 & Modo 17** on Windows.
 
 ## Comparison (200% Scaling)
+
+The screenshots below compare **default Modo** (scaled by Windows, without `High DPI scaling override`) against **Modo with this plugin enabled**:
 
 ### 1. Top Menu Bar, Layout Tabs & Selection Toolbar
 ![Top Menu and Toolbar](images/01_toolbar_comparison.png)
