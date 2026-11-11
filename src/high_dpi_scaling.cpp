@@ -51,6 +51,9 @@ typedef const void*    (*FnPainterBrush)(const void* painter);
 typedef void           (*FnPainterSetWindow)(void* painter, int x, int y, int w, int h);
 typedef void*          (*FnPainterDevice)(const void* painter);
 typedef void           (*FnFontSetStyleStrategy)(void* font_ptr, int strategy);
+typedef void           (*FnFontSetPointSize)(void* font_ptr, int pt);
+typedef void           (*FnFontSetPointSizeF)(void* font_ptr, double pt);
+typedef double         (*FnFontPointSizeF)(const void* font_ptr);
 typedef void           (*FnSetDpr)(void* this_ptr, double dpr);
 typedef double         (*FnGetDpr)(const void* this_ptr);
 
@@ -85,6 +88,9 @@ static FnPainterBrush         g_painter_brush        = nullptr;
 static FnPainterSetWindow     g_orig_set_window      = nullptr;
 static FnPainterDevice        g_painter_device       = nullptr;
 static FnFontSetStyleStrategy g_orig_font_style      = nullptr;
+static FnFontSetPointSize     g_orig_font_pt_size    = nullptr;
+static FnFontSetPointSizeF    g_qfont_set_pt_f       = nullptr;
+static FnFontPointSizeF       g_qfont_get_pt_f       = nullptr;
 
 static FnSetDpr               g_qimg_set_dpr         = nullptr;
 static FnGetDpr               g_qimg_get_dpr         = nullptr;
@@ -207,6 +213,25 @@ static void HookScissor(int x, int y, int w, int h) {
     } else if (g_agl_table && *g_agl_table) {
         reinterpret_cast<FnRect4>((*g_agl_table)[0x460 / 8])(ScaleInt(x), ScaleInt(y), ScaleInt(w), ScaleInt(h));
     }
+}
+
+// Modo 16's WPaneGLGetPixelRatio (front3000.dll+0x1B8CB0) calls Qt5's integer
+// QPaintDevice::devicePixelRatio(), truncating 1.25/1.5 to 1.0 before returning
+// double (whereas Modo 17 returns double directly). Return exact fractional DPR.
+static double HookWPaneGLGetPixelRatio(const uint8_t* pane) {
+    if (pane && g_qpd_get_dpr) {
+        const uint8_t* sub = *reinterpret_cast<const uint8_t* const*>(pane + 0xD8);
+        if (sub) {
+            const uint8_t* info = *reinterpret_cast<const uint8_t* const*>(sub + 0x10);
+            if (info && *reinterpret_cast<const int*>(info + 4) != 0) {
+                const uint8_t* glw = *reinterpret_cast<const uint8_t* const*>(sub + 0x18);
+                if (glw) {
+                    return g_qpd_get_dpr(glw + 0x10);
+                }
+            }
+        }
+    }
+    return g_scale;
 }
 
 // ============================================================================
@@ -528,6 +553,41 @@ static void HookFontSetStyleStrategy(void* font_ptr, int strategy) {
     g_orig_font_style(font_ptr, strategy);
 }
 
+// Modo bakes 3D OpenGL viewport text (header pill buttons & bottom-right HUD) into
+// 1-bit glBitmap display lists in WPaneGLDrawTextW and CreateGLFont.
+// - Modo 16 multiplies pointSize by Qt5's integer devicePixelRatio() (1.25/1.5 -> 1),
+//   leaving 3D viewport text unscaled at 125% and 150%.
+// - Modo 17 truncates (pointSize * dpr) to int via cvttsd2si.
+// - Both Modo 16 & 17 overwrite useLargeFont=1 with a hardcoded 56 pt without DPR scaling.
+// Verify the exact GL font call sites via _ReturnAddress() so non-GL QWidget fonts
+// (e.g. Modo 17 QLabel at +0xC15C41) remain untouched, and apply exact floating-point scaling.
+static void HookFontSetPointSize(void* font_ptr, int pt) {
+    if (g_scale > 1.001 && font_ptr && g_qfont_set_pt_f && g_qfont_get_pt_f) {
+        const uint8_t* ret = reinterpret_cast<const uint8_t*>(_ReturnAddress());
+        if (ret) {
+            // Modo 16 DPR-scaled GL font sites (imul reg, reg; mov edx, reg before call)
+            bool is_m16_dpr = (ret[-16] == 0x0F && ret[-15] == 0xAF && ret[-13] == 0x8B) ||
+                              (ret[-14] == 0x0F && ret[-13] == 0xAF && ret[-11] == 0x8B);
+            // Modo 17 DPR-scaled GL font sites (cvttsd2si edx, xmm before call)
+            bool is_m17_dpr = (ret[-15] == 0xF2 && ret[-14] == 0x0F && ret[-13] == 0x2C) ||
+                              (ret[-13] == 0xF2 && ret[-12] == 0x0F && ret[-11] == 0x2C);
+            if (is_m16_dpr || is_m17_dpr) {
+                double base_pt = g_qfont_get_pt_f(font_ptr);
+                if (base_pt > 0.0) {
+                    g_qfont_set_pt_f(font_ptr, base_pt * g_scale);
+                    return;
+                }
+            }
+            // Modo 16 & 17 CreateGLFont useLargeFont=1 site (je +0x0E; mov edx, 56 before call)
+            if (pt > 0 && ret[-16] == 0x74 && ret[-15] == 0x0E && ret[-14] == 0xBA && ret[-13] == 0x38) {
+                g_qfont_set_pt_f(font_ptr, static_cast<double>(pt) * g_scale);
+                return;
+            }
+        }
+    }
+    g_orig_font_pt_size(font_ptr, pt);
+}
+
 // ============================================================================
 // 3. IAT Lookup & Patching
 // ============================================================================
@@ -649,6 +709,8 @@ static void InstallAllHooks() {
     g_painter_brush     = reinterpret_cast<FnPainterBrush>(GetProcAddress(qtgui, "?brush@QPainter@@QEBAAEBVQBrush@@XZ"));
     g_qimg_dtor         = reinterpret_cast<FnQImageDtor>(GetProcAddress(qtgui, "??1QImage@@UEAA@XZ"));
     g_qimg_scanline     = reinterpret_cast<FnQImageScanLine>(GetProcAddress(qtgui, "?scanLine@QImage@@QEAAPEAEH@Z"));
+    g_qfont_set_pt_f    = reinterpret_cast<FnFontSetPointSizeF>(GetProcAddress(qtgui, "?setPointSizeF@QFont@@QEAAXN@Z"));
+    g_qfont_get_pt_f    = reinterpret_cast<FnFontPointSizeF>(GetProcAddress(qtgui, "?pointSizeF@QFont@@QEBANXZ"));
 
     // 1. 3D OpenGL Viewport IAT slots
     void** s_fbo_ctor   = FindIATSlot(front, "??0QOpenGLFramebufferObject@@QEAA@HHAEBVQOpenGLFramebufferObjectFormat@@@Z");
@@ -688,6 +750,7 @@ static void InstallAllHooks() {
     void** s_draw_pt2   = FindIATSlot(front, "?drawPoint@QPainter@@QEAAXHH@Z");
     void** s_set_win    = FindIATSlot(front, "?setWindow@QPainter@@QEAAXHHHH@Z");
     void** s_font_style = FindIATSlot(front, "?setStyleStrategy@QFont@@QEAAXW4StyleStrategy@1@@Z");
+    void** s_font_pt    = FindIATSlot(front, "?setPointSize@QFont@@QEAAXH@Z");
 
     if (s_fbo_ctor && s_fbo_width && s_fbo_height && s_fbo_blit && ((s_vp && s_sc) || (p_agl_vp && p_agl_sc))) {
         PatchSlot(s_fbo_ctor,   reinterpret_cast<void*>(&HookFboCtor),   reinterpret_cast<void**>(&g_orig_fbo_ctor));
@@ -723,6 +786,47 @@ static void InstallAllHooks() {
             PatchSlot(s_draw_pt2,   reinterpret_cast<void*>(&HookDrawPoint2),           reinterpret_cast<void**>(&g_orig_draw_point2));
             PatchSlot(s_set_win,    reinterpret_cast<void*>(&HookPainterSetWindow),     reinterpret_cast<void**>(&g_orig_set_window));
             PatchSlot(s_font_style, reinterpret_cast<void*>(&HookFontSetStyleStrategy), reinterpret_cast<void**>(&g_orig_font_style));
+            PatchSlot(s_font_pt,    reinterpret_cast<void*>(&HookFontSetPointSize),     reinterpret_cast<void**>(&g_orig_font_pt_size));
+        }
+
+        // Modo 16 fractional High-DPI (125% / 150%) truncation fixes:
+        // Modo 16 calls Qt5's integer QPaintDevice::devicePixelRatio() (which truncates
+        // 1.25/1.5 -> 1) in WPaneGLGetPixelRatio and GnzUI's Advanced Viewport resizeGL,
+        // whereas Modo 17 already uses Qt6's double overload.
+        if (s_vp && s_sc && g_qpd_get_dpr) {
+            static const uint8_t pat_wp_dpr[25] = {
+                0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x91, 0xD8, 0x00, 0x00, 0x00,
+                0x48, 0x8B, 0x42, 0x10, 0x48, 0x85, 0xC0, 0x74, 0x0D, 0x8B, 0x40,
+                0x04, 0x85, 0xC0
+            };
+            uint8_t* p_wp_dpr = FindCodePattern(front, 0x1B8CB0, pat_wp_dpr, "xxxxxxxxxxxxxxxxxxxxxxxxx", 25);
+            if (p_wp_dpr) {
+                PatchJump14(p_wp_dpr, reinterpret_cast<void*>(&HookWPaneGLGetPixelRatio));
+            }
+
+            auto* gnzui = reinterpret_cast<uint8_t*>(GetModuleHandleA("GnzUI.dll"));
+            if (gnzui) {
+                void** s_gnz_dpr = FindIATSlot(gnzui, "?devicePixelRatio@QPaintDevice@@QEBAHXZ");
+                static const uint8_t pat_gnz[16] = {
+                    0xF3, 0x0F, 0xE6, 0xD2, 0x66, 0x0F, 0x6E, 0xE0,
+                    0xF3, 0x0F, 0xE6, 0xE4, 0xF2, 0x0F, 0x59, 0xD4
+                };
+                uint8_t* p_gnz = FindCodePattern(gnzui, 0x22F2, pat_gnz, "xxxxxxxxxxxxxxxx", 16);
+                if (s_gnz_dpr && p_gnz) {
+                    static const uint8_t mov_xmm4_xmm0[8] = {
+                        0xF2, 0x0F, 0x10, 0xE0, 0x0F, 0x1F, 0x40, 0x00
+                    };
+                    uint8_t* p_conv = p_gnz + 4;
+                    DWORD old_prot = 0;
+                    if (VirtualProtect(p_conv, 8, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                        for (int i = 0; i < 8; ++i) p_conv[i] = mov_xmm4_xmm0[i];
+                        VirtualProtect(p_conv, 8, old_prot, &old_prot);
+                        FlushInstructionCache(GetCurrentProcess(), p_conv, 8);
+                        void* unused_orig = nullptr;
+                        PatchSlot(s_gnz_dpr, reinterpret_cast<void*>(g_qpd_get_dpr), &unused_orig);
+                    }
+                }
+            }
         }
 
         // Locate rotated vertical tab strip callers (90 deg CCW and CW) once at startup.
