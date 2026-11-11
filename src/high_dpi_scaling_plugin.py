@@ -281,7 +281,9 @@ class HighDPIScalingModeCmd(lxu.command.BasicCommand):
             val = self.dyna_String(0, pdata.get_mode())
             if val in ("system", "custom", "none"):
                 pdata.set_mode(val)
-        HighDPIScalingNotifier.Notify(lx.symbol.fCMDNOTIFY_CHANGE_ALL)
+        HighDPIScalingNotifier.Notify(
+            lx.symbol.fCMDNOTIFY_VALUE | lx.symbol.fCMDNOTIFY_DISABLE
+        )
 
 
 class HighDPIScalingCustomScaleCmd(lxu.command.BasicCommand):
@@ -339,7 +341,7 @@ class HighDPIScalingCustomScaleCmd(lxu.command.BasicCommand):
             label = self.dyna_String(0, pdata.get_custom_scale_label())
             if label in SCALE_BY_LABEL:
                 pdata.set_custom_scale_label(label)
-        HighDPIScalingNotifier.Notify(lx.symbol.fCMDNOTIFY_CHANGE_ALL)
+        HighDPIScalingNotifier.Notify(lx.symbol.fCMDNOTIFY_VALUE)
 
 
 def bootstrap():
