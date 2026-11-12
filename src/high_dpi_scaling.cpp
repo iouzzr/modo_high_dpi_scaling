@@ -3,8 +3,9 @@
 
 // high_dpi_scaling.cpp - High-DPI 3D Viewport & 2D UI (OPALDisp) Patch DLL for Foundry Modo (16.x & 17.x)
 // Hooks QOpenGLFramebufferObject, AGLViewport / AGLScissor, and QImage / QPaintDevice / QPainter / QFont
-// across Modo 16 (front3000.dll + frame3000.dll + Qt5Gui.dll) and Modo 17 (modo.exe + Qt6Gui.dll + Qt6OpenGL.dll)
+// across Modo 16 (front3000.dll + frame3000.dll + GnzUI.dll + Qt5Gui.dll) and Modo 17 (modo.exe + Qt6Gui.dll + Qt6OpenGL.dll)
 // to render both 3D viewports and 2D UI panels/text at native High-DPI physical resolution.
+// Reference RVAs below correspond to Modo 16.1v9 / 17.1v1; inline patches fall back to scanning .text via FindCodePattern.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -13,6 +14,10 @@
 
 #pragma intrinsic(_ReturnAddress)
 
+// Headerless POD ABI mirrors for Qt value types:
+// - QSizeC (2 ints) matches QSize and QPoint (reused in FnDrawPoints).
+// - QRectC (4 ints) matches QRect (closed interval: x2 = x + w - 1, y2 = y + h - 1)
+//   and QLine (x1, y1, x2, y2, reused in FnDrawLines).
 struct QSizeC {
     int w;
     int h;
@@ -33,6 +38,8 @@ typedef void  (*FnFboBlit)(void* target, const QRectC* targetRect, void* source,
 typedef void  (*FnRect4)(int x, int y, int w, int h);
 
 // 2D UI (OPALDisp / QImage / QPaintDevice / QPainter / QFont) function pointer types
+// Note: In MSVC x64 ABI, non-trivial return types (QSize in FnQImageSize, QImage in FnQImageCopy)
+// pass a hidden caller-allocated return buffer pointer in RDX (2nd parameter, after `this` in RCX).
 typedef void*          (*FnQImageCtorSize)(void* this_ptr, const QSizeC* sz, int fmt);
 typedef void*          (*FnQImageCtorWH)(void* this_ptr, int w, int h, int fmt);
 typedef void           (*FnQImageDtor)(void* this_ptr);
@@ -108,7 +115,7 @@ static double                 g_scale                = 1.0;
 static DWORD                  g_main_tid             = 0;
 static bool                   g_hooked               = false;
 
-// High-DPI buffer for rotated vertical tab strips (ORastToImage -> 90 deg rotation -> DispBlitImage)
+// High-DPI buffer for rotated vertical tab strips (ORastCreateImage -> 90 deg rotation -> DispDrawImage)
 static uint32_t*              g_rot_buf              = nullptr;
 static size_t                 g_rot_cap              = 0;
 static int                    g_rot_lw               = 0;
@@ -368,9 +375,9 @@ static void HookScissor(int x, int y, int w, int h) {
     }
 }
 
-// Modo 16's WPaneGLGetPixelRatio (front3000.dll+0x1B8CB0) calls Qt5's integer
-// QPaintDevice::devicePixelRatio(), truncating 1.25/1.5 to 1.0 before returning
-// double (whereas Modo 17 returns double directly). Return exact fractional DPR.
+// Modo 16's WPaneGLGetPixelRatio (body at front3000.dll+0x1B8CB0; export thunk at +0x1AC800)
+// calls Qt5's integer QPaintDevice::devicePixelRatio(), truncating 1.25/1.5 to 1.0 before
+// returning double (whereas Modo 17 returns double directly). Return exact fractional DPR.
 static double HookWPaneGLGetPixelRatio(const uint8_t* pane) {
     if (pane && g_qpd_get_dpr) {
         const uint8_t* sub = *reinterpret_cast<const uint8_t* const*>(pane + 0xD8);
@@ -390,8 +397,9 @@ static double HookWPaneGLGetPixelRatio(const uint8_t* pane) {
 // ============================================================================
 // 2. 2D UI (OPALDisp / QImage / QPaintDevice / QPainter / QFont) Hooks
 //    Modo's 2D panels, forms, trees, and buttons are rendered by OPAL into an
-//    offscreen QImage buffer (LUXQtWidget::m_image at [widget+0x48]) and then
-//    blitted onto the QWidget in LUXQtWidget::paintEvent. By default, Modo
+//    offscreen QImage buffer (LUXQt::LUXView::m_image at [widget+0x48] in Modo 16,
+//    [widget+0x40] in Modo 17 where Qt6 QWidget is 8 bytes smaller) and then
+//    blitted onto the QWidget in LUXQt::LUXView::paintEvent. By default, Modo
 //    allocates these offscreen QImages at 1x logical pixel size with DPR=1.0.
 // ============================================================================
 
@@ -410,11 +418,11 @@ static bool IsHighDpiPainter(const void* painter) {
     return dev && IsQImageDevice(dev) && GetPaintDeviceDpr(dev) > 1.001;
 }
 
-// LUXQtWidget::updateImage (Modo 16 +0x172077, Modo 17 +0xD703EA) constructs its
+// LUXQt::LUXView::updateImage (call at Modo 16 +0x172077, Modo 17 +0xD703EA) constructs its
 // offscreen ARGB32 (fmt == 5) backing QImage via QImage(const QSize&, Format).
-// Verify both Format_ARGB32 and the exact return site so non-LUXQtWidget callers stay 1:1.
+// Verify both Format_ARGB32 and the exact return site so non-LUXView callers stay 1:1.
 static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
-    // Return site in LUXQtWidget::updateImage: nop; mov rcx, rdi; call QWidget::palette
+    // Return site in LUXQt::LUXView::updateImage: nop; mov rcx, rdi; call QWidget::palette
     static constexpr uint8_t kSigUpdateImage[] = { 0x90, 0x48, 0x8B, 0xCF, 0xFF, 0x15 };
     if (g_scale > 1.001 && fmt == 5 && sz && sz->w > 0 && sz->h > 0 && g_qimg_set_dpr &&
         MatchReturnBytes(_ReturnAddress(), kSigUpdateImage)) {
@@ -426,11 +434,13 @@ static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
     return g_orig_qimg_ctor_size(this_ptr, sz, fmt);
 }
 
-// ORastCreate (Modo 16 +0x1B60D0, Modo 17 +0xD9ED10) allocates temporary offscreen
-// ARGB32 (fmt == 5) QImages via QImage(int w, int h, Format) for rasterizing text/tabs.
-// Only scale calls originating from ORastCreate so raw icon/texture assets stay 1:1.
+// OPALDisp's internal QtRasterDisplay / ORast create callback (call at Modo 16 +0x1B60D0,
+// Modo 17 +0xD9ED10; distinct from the ORastCreate wrapper exported at Modo 16 +0x5D40,
+// Modo 17 +0xAAB290) allocates temporary offscreen ARGB32 (fmt == 5) QImages via
+// QImage(int w, int h, Format) for text/tabs. Only scale calls from this callback so raw
+// icon/texture assets stay 1:1.
 static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
-    // Return site in ORastCreate: lea rax, [rip+disp32]; mov [rdi], rax
+    // Return site after QImage ctor: lea rax, [rip+disp32]; mov [rdi], rax (local QImage vftable)
     static constexpr uint8_t kSigORastCreate[] = { 0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x07 };
     if (g_scale > 1.001 && fmt == 5 && w > 0 && h > 0 && g_qimg_set_dpr &&
         MatchReturnPattern(_ReturnAddress(), kSigORastCreate, "xxx????xxx")) {
@@ -442,7 +452,7 @@ static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
 }
 
 // Report logical dimensions back to Modo for High-DPI QImages (dpr > 1.0) using
-// each QImage's own devicePixelRatio() so LUXQtWidget::updateImage, OPAL layout math,
+// each QImage's own devicePixelRatio() so LUXQt::LUXView::updateImage, OPAL layout math,
 // and QOpenGLWidget::grabFramebuffer / QPixmap::toImage consumers operate cleanly.
 static QSizeC* HookQImageSize(const void* this_ptr, QSizeC* out_sz) {
     QSizeC* res = g_orig_qimg_size(this_ptr, out_sz);
@@ -468,9 +478,9 @@ static int HookQImageWidth(const void* this_ptr) {
 }
 
 // Modo renders vertical tab strips by first drawing horizontal text into an
-// ORast QImage, converting it into a logical-sized ILxImage in QImageToILxImage
-// (Modo 16 +0x1A29E0, Modo 17 +0xD9A830), rotating the ILxImage 90 degrees on
-// the CPU (CCW or CW), and finally blitting via OPALDisp::BlitImage -> QPainter::drawImage.
+// ORast QImage, converting it into a logical-sized ILxImage via ORastCreateImage ->
+// QImageToILxImage (Modo 16 +0x1A29E0, Modo 17 +0xD9A830), rotating the ILxImage 90 degrees
+// on the CPU (CCW or CW), and blitting via DispDrawImage -> OPALDisp::BlitImage -> QPainter::drawImage.
 // Pre-rotate the physical High-DPI QImage into g_rot_buf here and substitute it in HookDrawImageXY.
 static int HookQImageHeight(const void* this_ptr) {
     int ph = g_orig_qimg_height(this_ptr);
@@ -517,6 +527,7 @@ static int HookQImageHeight(const void* this_ptr) {
                     if (g_rot_buf) {
                         for (int py = 0; py < ph; ++py) {
                             for (int px = 0; px < pw; ++px) {
+                                // Force opaque alpha (0xFF) so Format_ARGB32 tab pixels blit without alpha fade.
                                 uint32_t pix = g_orig_qimg_pixel(this_ptr, px, py) | 0xFF000000u;
                                 if (rot_mode == 1) {
                                     g_rot_buf[static_cast<size_t>(pw - 1 - px) * ph + py] = pix;
@@ -646,7 +657,7 @@ static bool HasActiveRotCallerFrame(const uint8_t* expected_site, const uint8_t*
     return false;
 }
 
-// Intercept OPALDisp::BlitImage (Modo 16 +0x1B59EE, Modo 17 +0xD9E71C) for rotated
+// Intercept OPALDisp::BlitImage (call at Modo 16 +0x1B59EE, Modo 17 +0xD9E71C) for rotated
 // vertical tab strips (captured in HookQImageHeight), verifying that an active stack
 // frame still lies inside the originating vertical tab function while normalizing
 // Qt sub-rects and clearing g_rot_valid so clipped tab buffers never leak onto 1x icons.
@@ -696,6 +707,7 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
                 if (psx2 > g_rot_pw) psx2 = g_rot_pw;
                 if (psy2 > g_rot_ph) psy2 = g_rot_ph;
                 if (psx2 > psx1 && psy2 > psy1) {
+                    // Headerless in-place QImage stack buffer (sizeof(QImage) is 32B in Qt5, 24B in Qt6).
                     alignas(16) uint8_t tmp_qimg[64];
                     g_orig_qimg_ctor_wh(tmp_qimg, g_rot_pw, g_rot_ph, 5);
                     g_qimg_set_dpr(tmp_qimg, g_rot_dpr);
@@ -725,17 +737,20 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
     g_orig_draw_image_xy(painter, x, y, img, sx, sy, sw, sh, flags);
 }
 
-// OPALDisp's 2D grid primitives (FillRect, DrawLine, DrawPoint) are converted to
-// QPainter::fillRect ONLY when called from OPALDisp onto a High-DPI QImage painter
-// so adjacent logical cells k and k+1 share the exact half-open physical interval
-// [round(k * dpr), round((k + 1) * dpr)) without affecting non-OPAL QPainters.
+// OPALDisp sets both QBrush(color) and QPainter::setPen(const QColor&) -- which in Qt5/Qt6
+// constructs a non-cosmetic pen of logical width 1.0 (cosmetic = false) -- across its 2D
+// primitives (FillRect, DrawLine, DrawPoint). Under fractional DPR (125% / 150%), a 1.0 * dpr
+// pen stroke does not partition physical pixels into the exact half-open interval
+// [round(k * dpr), round((k + 1) * dpr)) that QPainter::fillRect uses, causing 1px seams/overlaps.
+// Convert these primitives to QPainter::fillRect ONLY when called from OPALDisp onto a High-DPI QImage.
 
 // Return sites in OPALDisp::FillRect, OPALDisp::DrawLine (Modo 16 & 17), and OPALDisp::DrawPoint (Modo 16 & 17)
 static constexpr uint8_t kSigOpalFillRect[]  = { 0x48, 0x8D, 0x4C, 0x24, 0x38, 0xFF, 0x15 };
 static constexpr uint8_t kSigOpalDrawLine[]  = { 0x48, 0x8B, 0x4B, 0x18, 0xFF, 0x15 };
 static constexpr uint8_t kSigOpalDrawPoint[] = { 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00 };
 
-// OPALDisp::FillRect subtracts 1 from width/height before calling drawRects with Qt::NoPen. Restore +1.
+// OPALDisp::FillRect subtracts 1 from width/height before drawRects to compensate for the 1.0px
+// logical pen stroke expansion. Restore +1 (x2 + 1, y2 + 1) when forwarding to fillRect.
 static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     if (g_scale > 1.001 && rects && count == 1 && g_painter_fill_rect && g_painter_brush &&
         MatchReturnBytes(_ReturnAddress(), kSigOpalFillRect) && IsHighDpiPainter(painter)) {
@@ -746,8 +761,9 @@ static void HookDrawRects(void* painter, const QRectC* rects, int count) {
     g_orig_draw_rects(painter, rects, count);
 }
 
-// OPALDisp::DrawLine sets QBrush(color) and a 1-physical-pixel cosmetic QPen (width=0).
-// Convert axis-aligned lines to 1-logical-pixel fillRects to prevent 1px unpainted gaps.
+// Convert OPALDisp::DrawLine's axis-aligned 1.0px logical pen lines to 1-logical-cell fillRects
+// to prevent 1px unpainted gaps at fractional scales. Both drawLines(const QLine*, int) (used by
+// Qt5's inline drawLine header in Modo 16) and drawLine(int,int,int,int) (Modo 17 / Qt6) are hooked.
 static bool TryFillAxisLine(void* painter, int x1, int y1, int x2, int y2) {
     if (y1 == y2) {
         int lx1 = (x1 <= x2) ? x1 : x2;
@@ -784,8 +800,9 @@ static void HookDrawLine4(void* painter, int x1, int y1, int x2, int y2) {
     g_orig_draw_line4(painter, x1, y1, x2, y2);
 }
 
-// OPALDisp::DrawPoint uses a 1-physical-pixel cosmetic pen to erase square FillRect
-// corners and draw checkmarks/arrows. Convert to a 1x1 logical cell fillRect.
+// OPALDisp::DrawPoint uses its 1.0px logical pen to erase square FillRect corners and draw
+// checkmarks/arrows. Convert to a 1x1 logical cell fillRect across both drawPoints (Modo 16 / Qt5
+// inline header) and drawPoint (Modo 17 / Qt6 direct export).
 static void HookDrawPoints(void* painter, const QSizeC* points, int count) {
     if (g_scale > 1.001 && points && count == 1 && g_painter_fill_rect && g_painter_brush &&
         MatchReturnBytes(_ReturnAddress(), kSigOpalDrawPoint) && IsHighDpiPainter(painter)) {
@@ -826,7 +843,7 @@ static void HookPainterSetWindow(void* painter, int x, int y, int w, int h) {
     g_orig_set_window(painter, x, y, w, h);
 }
 
-// OPALDisp::DrawText (Modo 16 +0x1B579E, Modo 17 +0xD9E50E) sets QFont::NoAntialias
+// OPALDisp::DrawText (call at Modo 16 +0x1B579E, Modo 17 +0xD9E50E) sets QFont::NoAntialias
 // (0x100) on 2D UI fonts, producing jagged glyphs at High-DPI. Verify the exact
 // OPALDisp::DrawText return site before upgrading 0x100 to QFont::PreferAntialias
 // (0x80) so 3D OpenGL 1-bit Format_Mono bitmap fonts in WPaneGLDrawTextW and
@@ -849,7 +866,7 @@ static void HookFontSetStyleStrategy(void* font_ptr, int strategy) {
 // - Modo 17 truncates (pointSize * dpr) to int via cvttsd2si.
 // - Both Modo 16 & 17 overwrite useLargeFont=1 with a hardcoded 56 pt without DPR scaling.
 // Verify the exact GL font call sites via _ReturnAddress() so non-GL QWidget fonts
-// (e.g. Modo 17 QLabel at +0xC15C41) remain untouched, and apply exact floating-point scaling.
+// (e.g. Modo 17 QLabel call at +0xC15C41) remain untouched, and apply exact floating-point scaling.
 static void HookFontSetPointSize(void* font_ptr, int pt) {
     if (g_scale > 1.001 && font_ptr && g_qfont_set_pt_f && g_qfont_get_pt_f) {
         const auto* ret = static_cast<const uint8_t*>(_ReturnAddress());
@@ -1021,7 +1038,7 @@ static void PatchJump14(uint8_t* target, Fn dst_fn) {
 static void InstallAllHooks() {
     if (g_hooked) return;
 
-    // Modo 16 splits UI/GL into front3000.dll + frame3000.dll + Qt5Gui.dll;
+    // Modo 16 splits UI/GL into front3000.dll + frame3000.dll (+ GnzUI.dll) + Qt5Gui.dll;
     // Modo 17 statically links front/frame into modo.exe and uses Qt6Gui.dll.
     HMODULE front_mod = GetModuleHandleA("front3000.dll");
     const bool is_modo16 = (front_mod != nullptr);
@@ -1130,6 +1147,12 @@ static void InstallAllHooks() {
             PatchJump14(p_wp_dpr, &HookWPaneGLGetPixelRatio);
         }
 
+        // Cross-register return ABI patch for GnzUI.dll (Advanced Viewport resizeGL):
+        // GnzUI imports `int QPaintDevice::devicePixelRatio()` (returned in EAX) with a single
+        // call at +0x22D8, whereas `double QPaintDevice::devicePixelRatioF()` returns in XMM0.
+        // XMM0 stays untouched from +0x22DE through +0x22F6 (`p_gnz + 4`), where we replace
+        // `movd xmm4, eax; cvtdq2pd xmm4, xmm4` (8 bytes) with `movsd xmm4, xmm0; nop` BEFORE
+        // redirecting the IAT slot so EAX is never read uninitialized.
         auto* gnzui = reinterpret_cast<uint8_t*>(GetModuleHandleA("GnzUI.dll"));
         if (gnzui) {
             void** s_gnz_dpr = FindIATSlot(gnzui, "?devicePixelRatio@QPaintDevice@@QEBAHXZ");
@@ -1149,8 +1172,8 @@ static void InstallAllHooks() {
         }
     }
 
-    // Locate rotated vertical tab strip callers (90 deg CCW and CW) and their
-    // .pdata RUNTIME_FUNCTION end bounds once at startup.
+    // Locate rotated vertical tab strip ORastCreateImage call sites (90 deg CCW and CW)
+    // and their .pdata RUNTIME_FUNCTION end bounds once at startup.
     static const uint8_t pat_ccw[31] = {
         0x48, 0x8B, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
         0x4C, 0x8B, 0xC0, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
@@ -1170,11 +1193,11 @@ static void InstallAllHooks() {
         g_rot_cw_end  = GetFunctionEndOrFallback(g_ret_rot_cw);
     }
 
-    // Prevent LUXQtWidget::paintEvent (Modo 16 +0x1724A0, Modo 17 +0xD70770) from synchronously
-    // calling FireLazyHandlers(3, nullptr) before setting m_inPaintEvent = 1.
-    // Under High-DPI, if a lazy form layout handler resizes a widget mid-paint, Qt reallocates
-    // the window's QBackingStore QImage and frees the QPaintEngine* cached on the stack by
-    // QWidgetPrivate::drawWidget, causing a Use-After-Free Access Violation upon return.
+    // Prevent LUXQt::LUXView::paintEvent (Modo 16 +0x1724A0, Modo 17 +0xD70770) from synchronously
+    // calling FireLazyHandlers(3, nullptr) (call at Modo 16 +0x1724C3, Modo 17 +0xD70791) before
+    // setting m_inPaintEvent = 1. Under High-DPI, if a lazy form layout handler resizes a widget
+    // mid-paint, Qt reallocates the window's QBackingStore QImage and frees the QPaintEngine*
+    // cached on the stack by QWidgetPrivate::drawWidget, causing a Use-After-Free Access Violation.
     static const uint8_t pat_lazy16[15] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0x41, 0xC6, 0x46, 0x40, 0x01 };
     static const uint8_t pat_lazy17[14] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0xC6, 0x47, 0x38, 0x01 };
     uint8_t* p_lazy = is_modo16

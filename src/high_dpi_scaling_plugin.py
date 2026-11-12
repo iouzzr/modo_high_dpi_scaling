@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # HighDPIScaling lxserv plugin for Foundry Modo (16.x & 17.x)
-# 1. Pre-window bootstrapper (__COMPAT_LAYER=HighDpiAware, QT_SCALE_FACTOR, QT_FONT_DPI)
+# 1. Pre-main-window bootstrapper (__COMPAT_LAYER=HighDpiAware, QT_SCALE_FACTOR, QT_FONT_DPI)
 #    and early OpenGL FBO/Viewport + 2D UI hook installer.
 # 2. Native Modo Commands (high_dpi_scaling.mode, high_dpi_scaling.custom_scale),
 #    Notifier (high_dpi_scaling.notifier), and official lx.service.Persistence()
@@ -115,6 +115,8 @@ def get_cli_args(cmd_line=None):
 
 
 def clear_env_var(name):
+    # Clear both Python's os.environ and the Win32 PEB environment block so
+    # C++-initiated `app.restart` does not inherit MODO_HIDPI_CHILD=1.
     os.environ.pop(name, None)
     try:
         _SetEnvironmentVariableW(name, None)
@@ -187,6 +189,8 @@ def get_system_ppi():
             except Exception:
                 pass
 
+        # In the initial DPI-Unaware parent process (<dpiAware>false</dpiAware>), Windows virtualizes
+        # LOGPIXELSX (96) and HORZRES while DESKTOPHORZRES stays physical; reconstruct true system PPI.
         hdc = _GetDC(None)
         if not hdc:
             return 96
@@ -204,6 +208,8 @@ def get_system_ppi():
 
 
 def build_highdpi_compat_layer(existing):
+    # Strip conflicting user/parent DPI compatibility flags (e.g. ~ DPIUNAWARE, GDIDPISCALING)
+    # while preserving unrelated __COMPAT_LAYER tokens before appending HighDpiAware.
     conflict_substrings = ("dpiunaware", "gdidpiscaling", "highdpiaware")
     kept = []
     for tok in (existing or "").split():
@@ -223,6 +229,10 @@ def nearest_scale_for_ppi(ppi):
 
 
 class HighDPIScalingPersistData(object):
+    # Parse {conf}/HighDPIScaling.cfg directly via ElementTree in addition to lx.service.Persistence():
+    # bootstrap() runs during lxserv import BEFORE Modo's ConfigMasterEnable() loads user .cfg
+    # files into Persistence (so mode_val.GetString(0) raises LXe_NOTFOUND at bootstrap time).
+    # _fallback_mode / _fallback_label also serve as defaults before settings are ever saved.
     def __init__(self):
         self.mode_acc = None
         self.mode_val = None
@@ -393,6 +403,7 @@ class HighDPIScalingModeCmd(lxu.command.BasicCommand):
         for key in MODE_KEYS:
             name = msg_svc.ArgTypeOptionUserName(MODE_ARG_TYPE, key)
             desc = msg_svc.ArgTypeOptionDesc(MODE_ARG_TYPE, key)
+            # \x03(...) sequences are Modo rich-text escapes for inline bullet icons and bold text.
             lines.append(
                 f"\x03(i:MIMG_BULLET3,0)\x03(f:FONT_BOLD) {name}\x03(f:FONT_NORMAL):  {desc}"
             )
@@ -526,7 +537,8 @@ def bootstrap():
     # If this IS already the child process, clear MODO_HIDPI_CHILD from the
     # environment block (so future app.restart spawns a fresh bootstrap) and
     # install OpenGL/2D UI IAT hooks using the exact scale locked into QT_SCALE_FACTOR
-    # by the parent BEFORE any Modo window or FBO is created!
+    # by the parent BEFORE the main Modo window or any 3D FBO is created
+    # (note: Modo 17 displays its QSplashScreen before loading lxserv plugins).
     if os.environ.get("MODO_HIDPI_CHILD") == "1":
         locked_str = os.environ.get("QT_SCALE_FACTOR")
         clear_env_var("MODO_HIDPI_CHILD")
@@ -545,7 +557,12 @@ def bootstrap():
 
     effective_scale = compute_effective_scale()
 
-    # Prepare purely in-memory process environment variables (ZERO registry access)
+    # Prepare purely in-memory process environment variables (ZERO registry access):
+    # - Pin QT_ENABLE_HIGHDPI_SCALING=0, QT_AUTO_SCREEN_SCALE_FACTOR=0, and QT_FONT_DPI=96
+    #   so QT_SCALE_FACTOR is the sole scale source without OS/Qt double-scaling widgets or fonts.
+    # - Even "Do Not Scale" (1.0x) relaunches with __COMPAT_LAYER=HighDpiAware to escape
+    #   modo.exe's <dpiAware>false</dpiAware> manifest (preventing blurry Windows DWM bitmap
+    #   stretching); the child skips DLL hooks because install_early_hooks ignores scale <= 1.001.
     child_env = os.environ.copy()
     child_env["__COMPAT_LAYER"] = build_highdpi_compat_layer(child_env.get("__COMPAT_LAYER", ""))
     child_env["QT_ENABLE_HIGHDPI_SCALING"] = "0"
