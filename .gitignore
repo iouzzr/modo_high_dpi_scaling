@@ -2,6 +2,10 @@
 /build/
 /dist/
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # Visual Studio & VS Code local cache
 /.vs/
 /.vscode/
