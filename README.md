@@ -47,6 +47,10 @@ The screenshots below compare **default Modo** (scaled by Windows, without `High
    - **Scaling Mode**: Choose `Use System Setting`, `Use Custom Scaling`, or `Do Not Scale`.
    - **Custom Scaling Factor**: Select from the 4 preset options (`100%`, `125%`, `150%`, `200%`) when `Use Custom Scaling` is selected.
 
+## Known Issues
+
+- **Unresponsive Mouse Clicks on Multi-Monitor Setups**: On some multi-monitor setups, parts of the Modo window (e.g., the right side) may become unresponsive to mouse clicks.
+
 ## FAQ
 
 **Q: Why are 2D icons and button graphics still pixelated?**
@@ -75,12 +79,16 @@ cmake --build --preset release
 
 The built kit and archives will be generated in `dist/high_dpi_scaling/`, `dist/high_dpi_scaling.zip`, and `dist/high_dpi_scaling.lpk`.
 
+## Acknowledgments
+
+- Thanks to **mattpainter** on the Pixel Fondue Discord for testing and feedback.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ---
 
-*Built with [Google Antigravity](https://antigravity.google/) (Gemini 4 Argon).*
+*Built with [Google Antigravity](https://antigravity.google/) (Gemini 4 Argon & Carbon).*
 
 *Disclaimer: Modo is a registered trademark of The Foundry Visionmongers Ltd. This project is an independent third-party plugin and is not affiliated with or endorsed by Foundry.*
