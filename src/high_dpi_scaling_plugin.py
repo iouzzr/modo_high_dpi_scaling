@@ -3,12 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # HighDPIScaling lxserv plugin for Foundry Modo (16.x & 17.x)
-# 1. Pre-main-window bootstrapper (__COMPAT_LAYER=HighDpiAware, QT_SCALE_FACTOR, QT_FONT_DPI)
-#    and early OpenGL FBO/Viewport + 2D UI hook installer.
+# 1. Pre-main-window bootstrapper with environment snapshot/restoration, zero-relaunch
+#    short-circuit, transparent guardian bridge parent, Per-Monitor V2 dynamic cross-screen
+#    scaling ("system"), and early OpenGL FBO/Viewport + 2D UI + IPR hook installer.
 # 2. Native Modo Commands (high_dpi_scaling.mode, high_dpi_scaling.custom_scale),
 #    Notifier (high_dpi_scaling.notifier), and official lx.service.Persistence()
-#    storage (HighDPIScaling.cfg).
+#    storage (HighDPIScaling.cfg) honoring -noconfig / -dbon:noconfig / -config:<path>.
 import os
+import json
 import ctypes
 import subprocess
 import xml.etree.ElementTree as ET
@@ -20,7 +22,6 @@ KIT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DLL_PATH = os.path.join(KIT_DIR, "high_dpi_scaling.dll")
 PERSIST_ATOM_NAME = "HighDPIScaling"
 
-ALLOWED_SCALES = (1.0, 1.25, 1.5, 2.0)
 SCALE_OPTIONS = (
     ("100%", 1.0),
     ("125%", 1.25),
@@ -36,12 +37,78 @@ MODE_ARG_TYPE = "high_dpi_scaling-mode"
 MODE_KEYS = ("system", "custom", "none")
 NON_GUI_CLI_FLAGS = frozenset(("headless", "nowin", "slave", "worker", "telnet", "console"))
 
+SENSITIVE_ENV_VARS = (
+    "__COMPAT_LAYER",
+    "QT_ENABLE_HIGHDPI_SCALING",
+    "QT_AUTO_SCREEN_SCALE_FACTOR",
+    "QT_FONT_DPI",
+    "QT_SCALE_FACTOR",
+    "QT_SCALE_FACTOR_ROUNDING_POLICY",
+)
+ENV_SNAPSHOT_VAR = "_MODO_HIDPI_ENV_SNAPSHOT"
+
+_STD_INPUT_HANDLE = ctypes.c_uint32(-10 & 0xFFFFFFFF).value
+_STD_OUTPUT_HANDLE = ctypes.c_uint32(-11 & 0xFFFFFFFF).value
+_STD_ERROR_HANDLE = ctypes.c_uint32(-12 & 0xFFFFFFFF).value
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_HANDLE_FLAG_INHERIT = 0x00000001
+_FILE_TYPE_UNKNOWN = 0x0000
+_SW_HIDE = 0
+_INFINITE = 0xFFFFFFFF
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_MONITOR_DEFAULTTOPRIMARY = 1
+_MONITOR_DEFAULTTONEAREST = 2
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+
 _KEEPALIVE = []
 _persist_data = None
 
 
 class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _DpiPair(ctypes.Structure):
+    _fields_ = [("first", ctypes.c_double), ("second", ctypes.c_double)]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
 
 
 def _bind(dll, name, argtypes, restype):
@@ -51,7 +118,7 @@ def _bind(dll, name, argtypes, restype):
     return fn
 
 
-_KERNEL32 = ctypes.WinDLL("kernel32")
+_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _SHELL32 = ctypes.WinDLL("shell32")
 _USER32 = ctypes.WinDLL("user32")
 _GDI32 = ctypes.WinDLL("gdi32")
@@ -61,19 +128,78 @@ _LocalFree = _bind(_KERNEL32, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
 _SetEnvironmentVariableW = _bind(
     _KERNEL32, "SetEnvironmentVariableW", [ctypes.c_wchar_p, ctypes.c_wchar_p], ctypes.c_int
 )
+_GetEnvironmentVariableW = _bind(
+    _KERNEL32,
+    "GetEnvironmentVariableW",
+    [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32],
+    ctypes.c_uint32,
+)
 _GetModuleFileNameW = _bind(
     _KERNEL32, "GetModuleFileNameW", [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32], ctypes.c_uint32
 )
+_GetModuleHandleW = _bind(_KERNEL32, "GetModuleHandleW", [ctypes.c_wchar_p], ctypes.c_void_p)
+_GetProcAddress = _bind(_KERNEL32, "GetProcAddress", [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_void_p)
+_GetCurrentThreadId = _bind(_KERNEL32, "GetCurrentThreadId", [], ctypes.c_uint32)
+_GetStdHandle = _bind(_KERNEL32, "GetStdHandle", [ctypes.c_uint32], ctypes.c_void_p)
+_GetFileType = _bind(_KERNEL32, "GetFileType", [ctypes.c_void_p], ctypes.c_uint32)
+_SetHandleInformation = _bind(
+    _KERNEL32, "SetHandleInformation", [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_int
+)
+_CreateJobObjectW = _bind(
+    _KERNEL32, "CreateJobObjectW", [ctypes.c_void_p, ctypes.c_wchar_p], ctypes.c_void_p
+)
+_SetInformationJobObject = _bind(
+    _KERNEL32,
+    "SetInformationJobObject",
+    [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32],
+    ctypes.c_int,
+)
+_AssignProcessToJobObject = _bind(
+    _KERNEL32, "AssignProcessToJobObject", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int
+)
+_WaitForSingleObject = _bind(
+    _KERNEL32, "WaitForSingleObject", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_uint32
+)
+_GetExitCodeProcess = _bind(
+    _KERNEL32, "GetExitCodeProcess", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)], ctypes.c_int
+)
+_CloseHandle = _bind(_KERNEL32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int)
+
 _CommandLineToArgvW = _bind(
     _SHELL32, "CommandLineToArgvW", [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(ctypes.c_wchar_p)
 )
 _GetDC = _bind(_USER32, "GetDC", [ctypes.c_void_p], ctypes.c_void_p)
 _ReleaseDC = _bind(_USER32, "ReleaseDC", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int)
+_GetCursorPos = _bind(_USER32, "GetCursorPos", [ctypes.POINTER(_POINT)], ctypes.c_int)
+_GetForegroundWindow = _bind(_USER32, "GetForegroundWindow", [], ctypes.c_void_p)
 _MonitorFromPoint = _bind(_USER32, "MonitorFromPoint", [_POINT, ctypes.c_uint32], ctypes.c_void_p)
+_MonitorFromWindow = _bind(_USER32, "MonitorFromWindow", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_void_p)
+_IsWindowVisible = _bind(_USER32, "IsWindowVisible", [ctypes.c_void_p], ctypes.c_int)
+_ShowWindow = _bind(_USER32, "ShowWindow", [ctypes.c_void_p, ctypes.c_int], ctypes.c_int)
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
+_EnumThreadWindows = _bind(_USER32, "EnumThreadWindows", [ctypes.c_uint32, _WNDENUMPROC, ctypes.c_ssize_t], ctypes.c_int)
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t
+)
+_EnumDisplayMonitors = _bind(
+    _USER32,
+    "EnumDisplayMonitors",
+    [ctypes.c_void_p, ctypes.c_void_p, _MONITORENUMPROC, ctypes.c_ssize_t],
+    ctypes.c_int,
+)
 _GetDeviceCaps = _bind(_GDI32, "GetDeviceCaps", [ctypes.c_void_p, ctypes.c_int], ctypes.c_int)
 
 try:
+    _UCRTBASE = ctypes.CDLL("ucrtbase")
+    _wputenv_s = _bind(_UCRTBASE, "_wputenv_s", [ctypes.c_wchar_p, ctypes.c_wchar_p], ctypes.c_int)
+except Exception:
+    _wputenv_s = None
+
+try:
     _GetThreadDpiAwarenessContext = _bind(_USER32, "GetThreadDpiAwarenessContext", [], ctypes.c_void_p)
+    _SetThreadDpiAwarenessContext = _bind(
+        _USER32, "SetThreadDpiAwarenessContext", [ctypes.c_void_p], ctypes.c_void_p
+    )
     _GetAwarenessFromDpiAwarenessContext = _bind(
         _USER32, "GetAwarenessFromDpiAwarenessContext", [ctypes.c_void_p], ctypes.c_int
     )
@@ -85,6 +211,7 @@ try:
     )
 except Exception:
     _GetThreadDpiAwarenessContext = None
+    _SetThreadDpiAwarenessContext = None
     _GetAwarenessFromDpiAwarenessContext = None
     _GetDpiForMonitor = None
 
@@ -114,14 +241,124 @@ def get_cli_args(cmd_line=None):
         return []
 
 
+def set_or_clear_env_var(name, value=None):
+    # Synchronize Python os.environ, UCRT (_wputenv_s), and Win32 PEB (SetEnvironmentVariableW).
+    # Note: _wputenv_s(name, "") deletes the variable on Windows CRT, so when restoring an
+    # originally empty string "", SetEnvironmentVariableW(name, "") MUST be called last.
+    if value is None:
+        os.environ.pop(name, None)
+        if _wputenv_s is not None:
+            try:
+                _wputenv_s(name, "")
+            except Exception:
+                pass
+        try:
+            _SetEnvironmentVariableW(name, None)
+        except Exception:
+            pass
+    else:
+        val_str = str(value)
+        os.environ[name] = val_str
+        if _wputenv_s is not None:
+            try:
+                _wputenv_s(name, val_str)
+            except Exception:
+                pass
+        try:
+            _SetEnvironmentVariableW(name, val_str)
+        except Exception:
+            pass
+
+
 def clear_env_var(name):
-    # Clear both Python's os.environ and the Win32 PEB environment block so
-    # C++-initiated `app.restart` does not inherit MODO_HIDPI_CHILD=1.
-    os.environ.pop(name, None)
+    set_or_clear_env_var(name, None)
+
+
+def _read_win32_env_exact(name):
+    # Distinguish undefined (None) vs empty string ("") vs non-empty string in Win32 PEB.
+    if name in os.environ:
+        val = os.environ[name]
+        if val != "":
+            return val
     try:
-        _SetEnvironmentVariableW(name, None)
+        ctypes.set_last_error(0)
+        buf = ctypes.create_unicode_buffer(32768)
+        n = _GetEnvironmentVariableW(name, buf, len(buf))
+        err = ctypes.get_last_error()
+        if n > 0:
+            return buf.value
+        # ERROR_ENVVAR_NOT_FOUND == 203; n == 0 with err != 203 means defined as "" in Win32 PEB.
+        if err != 203:
+            return ""
     except Exception:
         pass
+    return os.environ.get(name, None)
+
+
+def capture_env_snapshot(source_env=None):
+    snap = {}
+    for key in SENSITIVE_ENV_VARS:
+        if source_env is not None:
+            snap[key] = source_env.get(key, None)
+        else:
+            snap[key] = _read_win32_env_exact(key)
+    return json.dumps(snap, separators=(",", ":"))
+
+
+def lock_qt_override_dpi():
+    # Invoke QPlatformScreen::overrideDpi once while QT_FONT_DPI is still in the child
+    # environment so QtGui initializes its function-local static DPI cache before cleanup.
+    if os.path.exists(DLL_PATH):
+        try:
+            dll = ctypes.CDLL(DLL_PATH)
+            _KEEPALIVE.append(dll)
+            if hasattr(dll, "LockQtOverrideDpi"):
+                dll.LockQtOverrideDpi.argtypes = []
+                dll.LockQtOverrideDpi.restype = None
+                dll.LockQtOverrideDpi()
+                return True
+        except Exception:
+            pass
+
+    qt_targets = (
+        ("Qt5Gui.dll", b"?overrideDpi@QPlatformScreen@@SA?AU?$QPair@NN@@AEBU2@@Z"),
+        ("Qt6Gui.dll", b"?overrideDpi@QPlatformScreen@@SA?AU?$pair@NN@std@@AEBU23@@Z"),
+    )
+    fn_type = ctypes.CFUNCTYPE(ctypes.POINTER(_DpiPair), ctypes.POINTER(_DpiPair), ctypes.POINTER(_DpiPair))
+    for dll_name, sym in qt_targets:
+        try:
+            hmod = _GetModuleHandleW(dll_name)
+            if not hmod:
+                continue
+            addr = _GetProcAddress(hmod, sym)
+            if not addr:
+                continue
+            fn = fn_type(addr)
+            out_pair = _DpiPair(0.0, 0.0)
+            in_pair = _DpiPair(96.0, 96.0)
+            fn(ctypes.byref(out_pair), ctypes.byref(in_pair))
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def restore_env_from_snapshot():
+    raw_snap = _read_win32_env_exact(ENV_SNAPSHOT_VAR)
+    if raw_snap:
+        try:
+            parsed = json.loads(raw_snap)
+            if isinstance(parsed, dict):
+                for key in SENSITIVE_ENV_VARS:
+                    val = parsed.get(key, None)
+                    if val is not None and not isinstance(val, str):
+                        val = str(val)
+                    set_or_clear_env_var(key, val)
+        except Exception:
+            pass
+    clear_env_var("MODO_HIDPI_CHILD")
+    clear_env_var("MODO_HIDPI_PMV2")
+    clear_env_var(ENV_SNAPSHOT_VAR)
 
 
 def get_host_exe_path():
@@ -152,6 +389,31 @@ def has_non_gui_cli_flag(args):
     return False
 
 
+def parse_config_cli_override(args=None):
+    # Returns ("noconfig", None), ("custom", path_str), or ("default", None).
+    if args is None:
+        args = get_cli_args()
+    custom_cfg = None
+    for raw_arg in args[1:]:
+        if not raw_arg or raw_arg[0] not in ("-", "/"):
+            continue
+        opt = raw_arg.lstrip("-") if raw_arg[0] == "-" else raw_arg[1:]
+        low = opt.lower()
+        if low == "noconfig":
+            return ("noconfig", None)
+        if low.startswith("dbon:") or low.startswith("dbon="):
+            tokens = low[5:].replace(";", ",").split(",")
+            if any(t.strip() == "noconfig" for t in tokens):
+                return ("noconfig", None)
+        if low.startswith("config:") or low.startswith("config="):
+            val = opt[7:].strip().strip('"').strip("'")
+            if val:
+                custom_cfg = val
+    if custom_cfg:
+        return ("custom", custom_cfg)
+    return ("default", None)
+
+
 def is_platform_headless():
     try:
         return bool(lx.service.Platform().IsHeadless())
@@ -169,17 +431,46 @@ def is_headless(exe_path=None, cmd_line=None):
     return has_non_gui_cli_flag(get_cli_args(cmd_line))
 
 
+def _query_active_monitor_handle():
+    pt = _POINT(0, 0)
+    try:
+        if _GetCursorPos(ctypes.byref(pt)):
+            hmon = _MonitorFromPoint(pt, _MONITOR_DEFAULTTONEAREST)
+            if hmon:
+                return hmon
+    except Exception:
+        pass
+    try:
+        hwnd = _GetForegroundWindow()
+        if hwnd:
+            hmon = _MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
+            if hmon:
+                return hmon
+    except Exception:
+        pass
+    try:
+        return _MonitorFromPoint(_POINT(0, 0), _MONITOR_DEFAULTTOPRIMARY)
+    except Exception:
+        return None
+
+
 def get_system_ppi():
     try:
-        # When running Per-Monitor DPI Aware (e.g. under __COMPAT_LAYER=HighDpiAware),
-        # query live effective monitor DPI via Shcore!GetDpiForMonitor so dynamic
-        # display scale changes or hot-plugged monitors without Windows sign-out are
-        # accurately detected instead of reading a stale logon GDI LOGPIXELSX value.
+        # Temporarily enter Per-Monitor Aware V2 on the calling thread so GetCursorPos and
+        # GetDpiForMonitor return unvirtualized per-monitor DPI even in the initial
+        # <dpiAware>false</dpiAware> parent process, and query the cursor/active monitor.
         if _GetDpiForMonitor is not None:
+            prev_ctx = None
+            switched = False
             try:
-                awareness = _GetAwarenessFromDpiAwarenessContext(_GetThreadDpiAwarenessContext())
-                if awareness >= 2:
-                    hmon = _MonitorFromPoint(_POINT(0, 0), 1)  # MONITOR_DEFAULTTOPRIMARY
+                if _SetThreadDpiAwarenessContext is not None:
+                    prev_ctx = _SetThreadDpiAwarenessContext(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+                    switched = bool(prev_ctx)
+                can_query = switched
+                if not can_query and _GetAwarenessFromDpiAwarenessContext is not None and _GetThreadDpiAwarenessContext is not None:
+                    can_query = _GetAwarenessFromDpiAwarenessContext(_GetThreadDpiAwarenessContext()) >= 2
+                if can_query:
+                    hmon = _query_active_monitor_handle()
                     if hmon:
                         dpi_x = ctypes.c_uint(0)
                         dpi_y = ctypes.c_uint(0)
@@ -188,9 +479,14 @@ def get_system_ppi():
                                 return int(dpi_x.value)
             except Exception:
                 pass
+            finally:
+                if switched and prev_ctx and _SetThreadDpiAwarenessContext is not None:
+                    try:
+                        _SetThreadDpiAwarenessContext(prev_ctx)
+                    except Exception:
+                        pass
 
-        # In the initial DPI-Unaware parent process (<dpiAware>false</dpiAware>), Windows virtualizes
-        # LOGPIXELSX (96) and HORZRES while DESKTOPHORZRES stays physical; reconstruct true system PPI.
+        # Fallback GDI reconstruction when Shcore per-monitor DPI is unavailable.
         hdc = _GetDC(None)
         if not hdc:
             return 96
@@ -205,6 +501,39 @@ def get_system_ppi():
     except Exception:
         pass
     return 96
+
+
+def are_all_monitors_96_ppi():
+    if _GetDpiForMonitor is None or _EnumDisplayMonitors is None:
+        return get_system_ppi() == 96
+    dpis = []
+
+    @_MONITORENUMPROC
+    def _cb(hmon, _hdc, _lprect, _lparam):
+        dx = ctypes.c_uint(0)
+        dy = ctypes.c_uint(0)
+        if _GetDpiForMonitor(hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0 and dx.value > 0:
+            dpis.append((int(dx.value), int(dy.value)))
+        else:
+            dpis.append((-1, -1))
+        return 1
+
+    prev_ctx = None
+    switched = False
+    try:
+        if _SetThreadDpiAwarenessContext is not None:
+            prev_ctx = _SetThreadDpiAwarenessContext(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            switched = bool(prev_ctx)
+        _EnumDisplayMonitors(None, None, _cb, 0)
+    except Exception:
+        return False
+    finally:
+        if switched and prev_ctx and _SetThreadDpiAwarenessContext is not None:
+            try:
+                _SetThreadDpiAwarenessContext(prev_ctx)
+            except Exception:
+                pass
+    return bool(dpis) and all(dx == 96 and dy == 96 for dx, dy in dpis)
 
 
 def build_highdpi_compat_layer(existing):
@@ -223,17 +552,11 @@ def build_highdpi_compat_layer(existing):
     return " ".join(kept)
 
 
-def nearest_scale_for_ppi(ppi):
-    ratio = float(ppi) / 96.0
-    return min(ALLOWED_SCALES, key=lambda s: abs(s - ratio))
-
-
 class HighDPIScalingPersistData(object):
-    # Parse {conf}/HighDPIScaling.cfg directly via ElementTree in addition to lx.service.Persistence():
+    # Parse HighDPIScaling.cfg directly via ElementTree in addition to lx.service.Persistence():
     # bootstrap() runs during lxserv import BEFORE Modo's ConfigMasterEnable() loads user .cfg
     # files into Persistence (so mode_val.GetString(0) raises LXe_NOTFOUND at bootstrap time).
-    # _fallback_mode / _fallback_label also serve as defaults before settings are ever saved.
-    def __init__(self):
+    def __init__(self, cli_args=None):
         self.mode_acc = None
         self.mode_val = None
         self._fallback_mode = "system"
@@ -242,20 +565,88 @@ class HighDPIScalingPersistData(object):
         self.scale_val = None
         self._fallback_label = "100%"
 
+        self._load_disk_fallback(cli_args=cli_args)
+
+    def _parse_cfg_atoms(self, cfg_file):
+        if not cfg_file or not os.path.isfile(cfg_file):
+            return False
         try:
-            conf_path = lx.service.Platform().Path("conf")
-            cfg_file = os.path.join(conf_path, f"{PERSIST_ATOM_NAME}.cfg")
-            if os.path.isfile(cfg_file):
-                root = ET.parse(cfg_file).getroot()
-                for atom in root.findall(f".//atom[@type='{PERSIST_ATOM_NAME}']/atom"):
+            root = ET.parse(cfg_file).getroot()
+            containers = root.findall(f".//atom[@type='{PERSIST_ATOM_NAME}']")
+            if not containers:
+                return False
+            found_value = False
+            for container in containers:
+                for atom in container.findall("atom"):
                     atype = atom.get("type")
                     text = (atom.text or "").strip()
                     if atype == "mode" and text in MODE_KEYS:
                         self._fallback_mode = text
+                        found_value = True
                     elif atype == "custom_scale" and text in SCALE_BY_LABEL:
                         self._fallback_label = text
+                        found_value = True
+            return found_value
         except Exception:
-            pass
+            return False
+
+    def _parse_cfg_spec(self, spec_path):
+        if not spec_path:
+            return False
+        if os.path.isdir(spec_path):
+            return self._parse_cfg_atoms(os.path.join(spec_path, f"{PERSIST_ATOM_NAME}.cfg"))
+        if os.path.isfile(spec_path):
+            if self._parse_cfg_atoms(spec_path):
+                return True
+            sibling = os.path.join(os.path.dirname(spec_path), f"{PERSIST_ATOM_NAME}.cfg")
+            if os.path.normcase(os.path.abspath(sibling)) != os.path.normcase(os.path.abspath(spec_path)):
+                return self._parse_cfg_atoms(sibling)
+        return False
+
+    def _load_disk_fallback(self, cli_args=None):
+        cfg_mode, custom_path = parse_config_cli_override(cli_args)
+        if cfg_mode == "noconfig":
+            return
+
+        try:
+            plat = lx.service.Platform()
+        except Exception:
+            plat = None
+
+        # 1. Base import layer (Configs\HighDPIScaling.cfg via ImportPathByIndex) so partial
+        #    overrides in conf / -config: merge cleanly rather than resetting unset atoms.
+        if plat is not None:
+            try:
+                count = int(plat.ImportPathCount())
+                for idx in range(count):
+                    imp_dir = plat.ImportPathByIndex(idx)
+                    if imp_dir and self._parse_cfg_atoms(os.path.join(imp_dir, f"{PERSIST_ATOM_NAME}.cfg")):
+                        break
+            except Exception:
+                pass
+        else:
+            user_dir = (os.environ.get("NEXUS_USER") or "").strip().strip('"').strip("'")
+            if not user_dir:
+                appdata = (os.environ.get("APPDATA") or "").strip()
+                if appdata:
+                    user_dir = os.path.join(appdata, "Luxology")
+            if user_dir:
+                self._parse_cfg_atoms(os.path.join(user_dir, "Configs", f"{PERSIST_ATOM_NAME}.cfg"))
+
+        # 2. Active user config override (-config:<path>, else plat.Path("conf") / NEXUS_CONFIG).
+        if cfg_mode == "custom" and custom_path:
+            self._parse_cfg_spec(custom_path)
+        elif cfg_mode == "default":
+            conf_path = None
+            if plat is not None:
+                try:
+                    conf_path = plat.Path("conf")
+                except Exception:
+                    conf_path = None
+            if not conf_path:
+                conf_path = (os.environ.get("NEXUS_CONFIG") or "").strip().strip('"').strip("'")
+            if conf_path:
+                self._parse_cfg_spec(conf_path)
 
     def get_mode(self):
         if self.mode_val is not None:
@@ -329,15 +720,20 @@ def persist_setup():
     return _persist_data
 
 
-def install_early_hooks(scale):
-    if scale <= 1.001 or not os.path.exists(DLL_PATH):
+def install_early_hooks(scale, dynamic_pmv2=False):
+    if (not dynamic_pmv2 and scale <= 1.001) or not os.path.exists(DLL_PATH):
         return
     try:
         dll = ctypes.CDLL(DLL_PATH)
         _KEEPALIVE.append(dll)
-        dll.SetHiDPIScale.argtypes = [ctypes.c_double]
-        dll.SetHiDPIScale.restype = None
-        dll.SetHiDPIScale(float(scale))
+        if hasattr(dll, "SetHiDPIConfig"):
+            dll.SetHiDPIConfig.argtypes = [ctypes.c_double, ctypes.c_int]
+            dll.SetHiDPIConfig.restype = None
+            dll.SetHiDPIConfig(float(scale), 1 if dynamic_pmv2 else 0)
+        else:
+            dll.SetHiDPIScale.argtypes = [ctypes.c_double]
+            dll.SetHiDPIScale.restype = None
+            dll.SetHiDPIScale(float(scale))
     except Exception:
         pass
 
@@ -517,8 +913,164 @@ def compute_effective_scale():
     if mode == "none":
         return 1.0
     if mode == "system":
-        return nearest_scale_for_ppi(get_system_ppi())
+        ratio = float(get_system_ppi()) / 96.0
+        return max(1.0, min(4.0, ratio))
     return SCALE_BY_LABEL.get(pdata.get_custom_scale_label(), 1.0)
+
+
+def hide_parent_splash_windows():
+    # Hide any early top-level QSplashScreen created on the current thread (Modo 17)
+    # so the guardian parent stays invisible while waiting on the child process.
+    @_WNDENUMPROC
+    def _cb(hwnd, _lparam):
+        try:
+            if _IsWindowVisible(hwnd):
+                _ShowWindow(hwnd, _SW_HIDE)
+        except Exception:
+            pass
+        return 1
+
+    try:
+        _EnumThreadWindows(_GetCurrentThreadId(), _cb, 0)
+    except Exception:
+        pass
+
+
+def _prepare_stdio_startupinfo():
+    valid_handles = []
+    resolved = []
+    for std_id in (_STD_INPUT_HANDLE, _STD_OUTPUT_HANDLE, _STD_ERROR_HANDLE):
+        h = None
+        try:
+            cand = _GetStdHandle(std_id)
+            if cand and cand != _INVALID_HANDLE_VALUE and _GetFileType(cand) != _FILE_TYPE_UNKNOWN:
+                if _SetHandleInformation(cand, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT):
+                    h = int(cand)
+                    if h not in valid_handles:
+                        valid_handles.append(h)
+        except Exception:
+            h = None
+        resolved.append(h or 0)
+
+    if not valid_handles:
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESTDHANDLES
+    si.hStdInput = resolved[0]
+    si.hStdOutput = resolved[1]
+    si.hStdError = resolved[2]
+    si.lpAttributeList = {"handle_list": valid_handles}
+    return si
+
+
+def _create_kill_on_close_job():
+    try:
+        hjob = _CreateJobObjectW(None, None)
+        if not hjob:
+            return None
+        # SILENT_BREAKAWAY_OK ensures grandchildren spawned by the child Modo process
+        # (such as app.restart, Kit restart="YES", or detached external DCC tools) break
+        # away from this bridge job instead of being terminated when the child exits.
+        for limit_flags in (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        ):
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = limit_flags
+            if _SetInformationJobObject(
+                hjob,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                return hjob
+        _CloseHandle(hjob)
+        return None
+    except Exception:
+        return None
+
+
+def run_guardian_bridge(cmd_line, exe_path, child_env):
+    hide_parent_splash_windows()
+    startupinfo = _prepare_stdio_startupinfo()
+    hjob = _create_kill_on_close_job()
+    exit_code = 0
+    try:
+        try:
+            proc = subprocess.Popen(
+                cmd_line,
+                executable=exe_path or None,
+                env=child_env,
+                startupinfo=startupinfo,
+                close_fds=True,
+            )
+        except OSError:
+            if startupinfo is None:
+                raise
+            proc = subprocess.Popen(
+                cmd_line,
+                executable=exe_path or None,
+                env=child_env,
+                close_fds=True,
+            )
+        proc_handle = int(proc._handle)
+        if hjob:
+            try:
+                _AssignProcessToJobObject(hjob, proc_handle)
+            except Exception:
+                pass
+        _WaitForSingleObject(proc_handle, _INFINITE)
+        raw_code = ctypes.c_uint32(0)
+        if _GetExitCodeProcess(proc_handle, ctypes.byref(raw_code)):
+            exit_code = int(raw_code.value)
+        else:
+            exit_code = int(proc.wait())
+    finally:
+        if hjob:
+            try:
+                _CloseHandle(hjob)
+            except Exception:
+                pass
+    os._exit(exit_code)
+
+
+def build_child_environment(mode, effective_scale, base_env=None):
+    child_env = dict(os.environ if base_env is None else base_env)
+    if ENV_SNAPSHOT_VAR not in child_env:
+        child_env[ENV_SNAPSHOT_VAR] = capture_env_snapshot(
+            source_env=None if base_env is None else child_env
+        )
+    child_env["__COMPAT_LAYER"] = build_highdpi_compat_layer(child_env.get("__COMPAT_LAYER", ""))
+
+    if mode == "system":
+        # Per-Monitor V2 dynamic cross-screen mode: Qt tracks each monitor's live DPI via
+        # PassThrough without global QT_SCALE_FACTOR or QT_FONT_DPI overrides.
+        child_env["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+        child_env["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+        child_env.pop("QT_AUTO_SCREEN_SCALE_FACTOR", None)
+        child_env.pop("QT_FONT_DPI", None)
+        child_env.pop("QT_SCALE_FACTOR", None)
+        child_env["MODO_HIDPI_PMV2"] = "1"
+    else:
+        child_env["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+        child_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+        child_env["QT_FONT_DPI"] = "96"
+        child_env.pop("QT_SCALE_FACTOR_ROUNDING_POLICY", None)
+        child_env.pop("MODO_HIDPI_PMV2", None)
+        if effective_scale > 1.001:
+            scale_str = (
+                str(int(effective_scale))
+                if effective_scale == int(effective_scale)
+                else str(effective_scale)
+            )
+        else:
+            scale_str = "1"
+        child_env["QT_SCALE_FACTOR"] = scale_str
+
+    child_env["MODO_HIDPI_CHILD"] = "1"
+    return child_env
 
 
 def bootstrap():
@@ -530,18 +1082,23 @@ def bootstrap():
         exe_path = get_host_exe_path()
         cmd_line = get_command_line()
     if is_headless(exe_path=exe_path, cmd_line=cmd_line):
-        if "MODO_HIDPI_CHILD" in os.environ:
-            clear_env_var("MODO_HIDPI_CHILD")
+        if "MODO_HIDPI_CHILD" in os.environ or ENV_SNAPSHOT_VAR in os.environ:
+            restore_env_from_snapshot()
+        return
+    host_name = get_host_exe_name(exe_path)
+    if not host_name.startswith("modo"):
         return
 
-    # If this IS already the child process, clear MODO_HIDPI_CHILD from the
-    # environment block (so future app.restart spawns a fresh bootstrap) and
-    # install OpenGL/2D UI IAT hooks using the exact scale locked into QT_SCALE_FACTOR
-    # by the parent BEFORE the main Modo window or any 3D FBO is created
-    # (note: Modo 17 displays its QSplashScreen before loading lxserv plugins).
+    # Child process:
+    # 1. Lock QT_FONT_DPI into QtGui's static cache via QPlatformScreen::overrideDpi.
+    # 2. Restore UCRT + Win32 PEB + Python os.environ from _MODO_HIDPI_ENV_SNAPSHOT so
+    #    licensingapp.exe, external DCC subprocesses, and app.restart stay unpolluted.
+    # 3. Install OpenGL/2D UI/IPR hooks before the main window or any 3D FBO is created.
     if os.environ.get("MODO_HIDPI_CHILD") == "1":
+        pmv2_mode = os.environ.get("MODO_HIDPI_PMV2") == "1"
         locked_str = os.environ.get("QT_SCALE_FACTOR")
-        clear_env_var("MODO_HIDPI_CHILD")
+        lock_qt_override_dpi()
+        restore_env_from_snapshot()
         child_scale = None
         if locked_str:
             try:
@@ -552,43 +1109,30 @@ def bootstrap():
                 pass
         if child_scale is None:
             child_scale = compute_effective_scale()
-        install_early_hooks(child_scale)
+        install_early_hooks(child_scale, dynamic_pmv2=pmv2_mode)
         return
 
+    pdata = persist_setup()
+    mode = pdata.get_mode()
     effective_scale = compute_effective_scale()
 
-    # Prepare purely in-memory process environment variables (ZERO registry access):
-    # - Pin QT_ENABLE_HIGHDPI_SCALING=0, QT_AUTO_SCREEN_SCALE_FACTOR=0, and QT_FONT_DPI=96
-    #   so QT_SCALE_FACTOR is the sole scale source without OS/Qt double-scaling widgets or fonts.
-    # - Even "Do Not Scale" (1.0x) relaunches with __COMPAT_LAYER=HighDpiAware to escape
-    #   modo.exe's <dpiAware>false</dpiAware> manifest (preventing blurry Windows DWM bitmap
-    #   stretching); the child skips DLL hooks because install_early_hooks ignores scale <= 1.001.
-    child_env = os.environ.copy()
-    child_env["__COMPAT_LAYER"] = build_highdpi_compat_layer(child_env.get("__COMPAT_LAYER", ""))
-    child_env["QT_ENABLE_HIGHDPI_SCALING"] = "0"
-    child_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
-    child_env["QT_FONT_DPI"] = "96"
-
-    if effective_scale > 1.001:
-        scale_str = (
-            str(int(effective_scale))
-            if effective_scale == int(effective_scale)
-            else str(effective_scale)
-        )
-    else:
-        scale_str = "1"
-
-    child_env["QT_SCALE_FACTOR"] = scale_str
-    child_env["MODO_HIDPI_CHILD"] = "1"
+    # Zero-restart short-circuit when target scale is 1.0x and every attached monitor is 96 PPI.
+    if effective_scale <= 1.001 and are_all_monitors_96_ppi():
+        return
 
     if not cmd_line:
         return
-    subprocess.Popen(cmd_line, executable=exe_path or None, env=child_env)
-    os._exit(0)
+
+    child_env = build_child_environment(mode, effective_scale)
+    run_guardian_bridge(cmd_line, exe_path, child_env)
 
 
 try:
     bootstrap()
+except Exception:
+    pass
+
+try:
     persist_setup()
     lx.bless(HighDPIScalingNotifier, NOTIFIER_NAME)
     lx.bless(HighDPIScalingModeCmd, CMD_MODE_NAME)
