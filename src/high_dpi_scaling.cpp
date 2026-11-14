@@ -89,6 +89,8 @@ typedef void*          (*FnQImageCtorWH)(void* this_ptr, int w, int h, int fmt);
 typedef void*          (*FnQImageCopyCtor)(void* dst_qimg, const void* src_qimg);
 typedef void           (*FnQImageDtor)(void* this_ptr);
 typedef uint8_t*       (*FnQImageScanLine)(void* this_ptr, int row);
+typedef const uint8_t* (*FnQImageConstScanLine)(const void* this_ptr, int row);
+typedef int            (*FnQImageFormat)(const void* this_ptr);
 typedef QSizeC*        (*FnQImageSize)(const void* this_ptr, QSizeC* out_sz);
 typedef void*          (*FnQImageCopy)(const void* this_ptr, void* out_img, int x, int y, int w, int h);
 typedef uint32_t       (*FnQImagePixel)(const void* this_ptr, int x, int y);
@@ -135,7 +137,7 @@ typedef void           (*FnRendWinPaint)(void* pane, void* disp_ref, int flags);
 typedef int            (*FnRendWinUpdateImage)(void* a1, void* a2, void* a3, void* a4);
 typedef void           (*FnRendWinSetZoom)(double zoom);
 typedef int64_t        (*FnRendWinMouseEvent)(void* a1, void* a2, void* a3, void* a4);
-typedef int            (*FnRendWinScrollbarGet)(void* a1, int a2, int a3, void* a4, void* a5, void* a6, void* a7, void* a8);
+typedef int            (*FnRendWinScrollbarGet)(void* a1, int a2, int a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9);
 typedef int            (*FnRendWinGetScaleAndOffset)(void* a1, void* a2, void* a3, void* a4);
 typedef int64_t        (*FnRendWinCenterAtNormalized)(double cx, double cy);
 typedef void           (*FnRendWinPaneToNormalized)(int x, int y, void* out_nx, void* out_ny);
@@ -143,6 +145,8 @@ typedef int            (*FnRendWinNormalizedToPane)(double nx, double ny, void* 
 typedef int            (*FnImageGetSize)(void* img, int* out_w, int* out_h);
 typedef void           (*FnRendWinBlitVignette)(void* orast, void* img, int ox, int oy, int pane_w, int pane_h);
 typedef void           (*FnRendWinWipeBlit)(void* orast, void* slot_b, int ox, int oy, int pane_w, int pane_h);
+typedef void           (*FnOpalBlitCopy)(void* src_disp, int sx, int sy, void* dst_disp, int dx, int dy, int w, int h);
+typedef void           (*FnTabBlitCCW)(const void* tab_ctrl, void* dst_disp, void* src_disp, int src_w, int src_h, int offset);
 
 static FnFboFmtCtor               g_fbo_fmt_ctor              = nullptr;
 static FnFboFmtDtor               g_fbo_fmt_dtor              = nullptr;
@@ -165,6 +169,8 @@ static FnQImageCtorWH             g_orig_qimg_ctor_wh         = nullptr;
 static FnQImageCopyCtor           g_qimg_copy_ctor            = nullptr;
 static FnQImageDtor               g_qimg_dtor                 = nullptr;
 static FnQImageScanLine           g_qimg_scanline             = nullptr;
+static FnQImageConstScanLine      g_qimg_const_scanline       = nullptr;
+static FnQImageFormat             g_qimg_format               = nullptr;
 static FnQImageSize               g_orig_qimg_size            = nullptr;
 static FnDim                      g_orig_qimg_width           = nullptr;
 static FnDim                      g_orig_qimg_height          = nullptr;
@@ -225,6 +231,10 @@ static FnRendWinNormalizedToPane      g_orig_rw_norm_to_pane      = nullptr;
 static FnImageGetSize                 g_orig_image_get_size       = nullptr;
 static FnRendWinBlitVignette          g_orig_rw_blit_vignette     = nullptr;
 static FnRendWinWipeBlit              g_orig_rw_wipe_blit         = nullptr;
+static FnTabBlitCCW                   g_orig_tab_blit_ccw         = nullptr;
+
+static RUNTIME_FUNCTION               g_cw_unwind_rf              = {};
+static bool                           g_cw_unwind_registered      = false;
 
 static double*                    g_rendwin_zoom              = nullptr;
 static void**                     g_rendwin_pane_ptr          = nullptr;
@@ -239,10 +249,6 @@ static const uint8_t*             g_front_text_begin          = nullptr;
 static const uint8_t*             g_front_text_end            = nullptr;
 static const uint8_t*             g_nexus_text_begin          = nullptr;
 static const uint8_t*             g_nexus_text_end            = nullptr;
-static const uint8_t*             g_ret_rot_ccw               = nullptr;
-static const uint8_t*             g_rot_ccw_end               = nullptr;
-static const uint8_t*             g_ret_rot_cw                = nullptr;
-static const uint8_t*             g_rot_cw_end                = nullptr;
 
 static double                     g_scale                     = 1.0;
 static bool                       g_pmv2_mode                 = false;
@@ -265,19 +271,6 @@ static bool                       g_rendwin_has_dpr           = false;
 static int                        g_rw_zoom_depth             = 0;
 static double                     g_rw_phys_zoom              = 1.0;
 static double                     g_rw_active_dpr             = 1.0;
-
-// High-DPI buffer for rotated vertical tab strips (ORastCreateImage -> 90 deg rotation -> DispDrawImage)
-static uint32_t*                  g_rot_buf                   = nullptr;
-static size_t                     g_rot_cap                   = 0;
-static int                        g_rot_lw                    = 0;
-static int                        g_rot_lh                    = 0;
-static int                        g_rot_pw                    = 0;
-static int                        g_rot_ph                    = 0;
-static double                     g_rot_dpr                   = 1.0;
-static uint64_t                   g_rot_tick                  = 0;
-static const uint8_t*             g_rot_expected_site         = nullptr;
-static const uint8_t*             g_rot_expected_end          = nullptr;
-static bool                       g_rot_valid                 = false;
 
 static double AbsDouble(double v) {
     return (v < 0.0) ? -v : v;
@@ -337,12 +330,6 @@ static bool MatchNexusReturnPattern(const void* ret_addr, const uint8_t (&pat)[N
     static_assert(M == N + 1, "Mask length must match pattern length");
     const auto* ret = static_cast<const uint8_t*>(ret_addr);
     return IsInNexusText(ret, 0, N) && MatchPattern(ret, pat, mask, N);
-}
-
-static void ResetRotState() {
-    g_rot_valid         = false;
-    g_rot_expected_site = nullptr;
-    g_rot_expected_end  = nullptr;
 }
 
 static int ScaleByDpr(int64_t v, double dpr) {
@@ -1155,69 +1142,11 @@ static int HookQImageWidth(const void* this_ptr) {
 
 static int HookQImageHeight(const void* this_ptr) {
     int ph = g_orig_qimg_height(this_ptr);
-    if (!IsHighDpiActive()) return ph;
-
-    static constexpr uint8_t kSigQImageToILx[] = { 0x48, 0x8B, 0xCE, 0x8B, 0xD8, 0xFF, 0x15 };
-    const bool is_q2i_main = MatchReturnBytes(_ReturnAddress(), kSigQImageToILx) &&
-                             GetCurrentThreadId() == g_main_tid;
-    if (is_q2i_main) {
-        ResetRotState();
-    }
-
-    double dpr = GetImageDpr(this_ptr);
-    if (dpr > 1.001) {
-        int lh = UnscaleDimByDpr(ph, dpr);
-        if (is_q2i_main && g_orig_qimg_width && g_orig_qimg_pixel) {
-            void* frames[12] = {};
-            USHORT num_frames = CaptureStackBackTrace(0, 12, frames, nullptr);
-            int rot_mode = 0; // 1 = 90 deg CCW, 2 = 90 deg CW
-            for (USHORT i = 0; i < num_frames; ++i) {
-                const uint8_t* caller_ret = reinterpret_cast<const uint8_t*>(frames[i]);
-                if (g_ret_rot_ccw && caller_ret == g_ret_rot_ccw) {
-                    rot_mode = 1;
-                    break;
-                }
-                if (g_ret_rot_cw && caller_ret == g_ret_rot_cw) {
-                    rot_mode = 2;
-                    break;
-                }
-            }
-            if (rot_mode != 0) {
-                int pw = g_orig_qimg_width(this_ptr);
-                int lw = UnscaleDimByDpr(pw, dpr);
-                if (pw > 0 && ph > 0 && lw > 0 && lh > 0) {
-                    size_t needed = static_cast<size_t>(pw) * static_cast<size_t>(ph);
-                    if (needed > g_rot_cap) {
-                        if (g_rot_buf) VirtualFree(g_rot_buf, 0, MEM_RELEASE);
-                        g_rot_buf = reinterpret_cast<uint32_t*>(
-                            VirtualAlloc(nullptr, needed * sizeof(uint32_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-                        g_rot_cap = g_rot_buf ? needed : 0;
-                    }
-                    if (g_rot_buf) {
-                        for (int py = 0; py < ph; ++py) {
-                            for (int px = 0; px < pw; ++px) {
-                                uint32_t pix = g_orig_qimg_pixel(this_ptr, px, py) | 0xFF000000u;
-                                if (rot_mode == 1) {
-                                    g_rot_buf[static_cast<size_t>(pw - 1 - px) * ph + py] = pix;
-                                } else {
-                                    g_rot_buf[static_cast<size_t>(px) * ph + (ph - 1 - py)] = pix;
-                                }
-                            }
-                        }
-                        g_rot_lw            = lh;
-                        g_rot_lh            = lw;
-                        g_rot_pw            = ph;
-                        g_rot_ph            = pw;
-                        g_rot_dpr           = dpr;
-                        g_rot_tick          = GetTickCount64();
-                        g_rot_expected_site = (rot_mode == 1) ? g_ret_rot_ccw : g_ret_rot_cw;
-                        g_rot_expected_end  = (rot_mode == 1) ? g_rot_ccw_end : g_rot_cw_end;
-                        g_rot_valid         = true;
-                    }
-                }
-            }
+    if (IsHighDpiActive()) {
+        double dpr = GetImageDpr(this_ptr);
+        if (dpr > 1.001) {
+            return UnscaleDimByDpr(ph, dpr);
         }
-        return lh;
     }
     return ph;
 }
@@ -1306,90 +1235,10 @@ static void HookDrawImageRectRect(void* painter, const QRectC* tr, const void* i
     g_orig_draw_image_rr(painter, tr, img, sr, flags);
 }
 
-static bool HasActiveRotCallerFrame(const uint8_t* expected_site, const uint8_t* expected_end) {
-    if (!expected_site || !expected_end || expected_end <= expected_site) return false;
-    void* frames[12] = {};
-    USHORT num_frames = CaptureStackBackTrace(0, 12, frames, nullptr);
-    for (USHORT i = 0; i < num_frames; ++i) {
-        const uint8_t* caller_ret = reinterpret_cast<const uint8_t*>(frames[i]);
-        if (caller_ret > expected_site && caller_ret < expected_end) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx, int sy, int sw, int sh, int flags) {
     static constexpr uint8_t kSigOpalBlitImage[] = {
         0x89, 0x7C, 0x24, 0x20, 0x44, 0x8B, 0xCE, 0x44, 0x8B, 0xC5
     };
-    if (g_rot_valid && IsHighDpiActive() && GetCurrentThreadId() == g_main_tid &&
-        MatchReturnBytes(_ReturnAddress(), kSigOpalBlitImage)) {
-        const uint8_t* expected_site = g_rot_expected_site;
-        const uint8_t* expected_end  = g_rot_expected_end;
-        ResetRotState();
-
-        if ((GetTickCount64() - g_rot_tick <= 250) &&
-            HasActiveRotCallerFrame(expected_site, expected_end) &&
-            IsHighDpiPainter(painter) && img && GetImageDpr(img) <= 1.001 &&
-            g_orig_qimg_width && g_orig_qimg_height &&
-            g_orig_qimg_width(img) == g_rot_lw && g_orig_qimg_height(img) == g_rot_lh &&
-            g_orig_qimg_ctor_wh && g_qimg_dtor && g_qimg_scanline && g_qimg_set_dpr && g_orig_draw_image_rr) {
-            int64_t nx  = x;
-            int64_t ny  = y;
-            int64_t nsx = sx;
-            int64_t nsy = sy;
-            int64_t nsw = (sw < 0) ? (static_cast<int64_t>(g_rot_lw) - nsx) : sw;
-            int64_t nsh = (sh < 0) ? (static_cast<int64_t>(g_rot_lh) - nsy) : sh;
-            if (nsx < 0) {
-                nx  -= nsx;
-                nsw += nsx;
-                nsx  = 0;
-            }
-            if (nsy < 0) {
-                ny  -= nsy;
-                nsh += nsy;
-                nsy  = 0;
-            }
-            if (nsx + nsw > g_rot_lw) nsw = static_cast<int64_t>(g_rot_lw) - nsx;
-            if (nsy + nsh > g_rot_lh) nsh = static_cast<int64_t>(g_rot_lh) - nsy;
-
-            if (nsw > 0 && nsh > 0) {
-                int psx1 = ScaleByDpr(nsx, g_rot_dpr);
-                int psy1 = ScaleByDpr(nsy, g_rot_dpr);
-                int psx2 = ScaleByDpr(nsx + nsw, g_rot_dpr);
-                int psy2 = ScaleByDpr(nsy + nsh, g_rot_dpr);
-                if (psx1 < 0) psx1 = 0;
-                if (psy1 < 0) psy1 = 0;
-                if (psx2 > g_rot_pw) psx2 = g_rot_pw;
-                if (psy2 > g_rot_ph) psy2 = g_rot_ph;
-                if (psx2 > psx1 && psy2 > psy1) {
-                    alignas(16) uint8_t tmp_qimg[64];
-                    g_orig_qimg_ctor_wh(tmp_qimg, g_rot_pw, g_rot_ph, 5);
-                    g_qimg_set_dpr(tmp_qimg, g_rot_dpr);
-                    for (int ry = 0; ry < g_rot_ph; ++ry) {
-                        uint32_t* dst = reinterpret_cast<uint32_t*>(g_qimg_scanline(tmp_qimg, ry));
-                        const uint32_t* src = g_rot_buf + static_cast<size_t>(ry) * g_rot_pw;
-                        if (dst) {
-                            for (int rx = 0; rx < g_rot_pw; ++rx) {
-                                dst[rx] = src[rx];
-                            }
-                        }
-                    }
-                    QRectC tr = {
-                        static_cast<int>(nx),
-                        static_cast<int>(ny),
-                        static_cast<int>(nx + nsw - 1),
-                        static_cast<int>(ny + nsh - 1)
-                    };
-                    QRectC sr = { psx1, psy1, psx2 - 1, psy2 - 1 };
-                    g_orig_draw_image_rr(painter, &tr, tmp_qimg, &sr, flags);
-                    g_qimg_dtor(tmp_qimg);
-                    return;
-                }
-            }
-        }
-    }
     if (g_in_rendwin_paint && IsHighDpiActive() && GetCurrentThreadId() == g_main_tid &&
         g_rendwin_paint_dpr > 1.001 && MatchReturnBytes(_ReturnAddress(), kSigOpalBlitImage) &&
         IsHighDpiPainter(painter) && img && GetImageDpr(img) <= 1.001 &&
@@ -1407,6 +1256,299 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
         }
     }
     g_orig_draw_image_xy(painter, x, y, img, sx, sy, sw, sh, flags);
+}
+
+// Stateless High-DPI 90-degree vertical tab rotation (90 deg CCW and 90 deg CW):
+// Rotates src_disp's physical QImage directly into a stack-local High-DPI QImage and blits
+// it onto dst_disp via OPALDisp::BlitCopy (src_vtable[0x90 / 8]), bypassing Modo's 1x ILxImage.
+static bool BlitRotatedDisplayRef(
+    bool  rot_cw,
+    void* src_disp,
+    void* dst_disp,
+    int   dst_x,
+    int   dst_y,
+    int   dst_w,
+    int   dst_h)
+{
+    if (!IsHighDpiActive() || (g_main_tid != 0 && GetCurrentThreadId() != g_main_tid) ||
+        !src_disp || !dst_disp || src_disp == dst_disp ||
+        dst_w <= 0 || dst_h <= 0 || dst_w > 16384 || dst_h > 16384 ||
+        !g_orig_qimg_ctor_wh || !g_qimg_dtor || !g_qimg_scanline || !g_qimg_set_dpr ||
+        !g_orig_qimg_width || !g_orig_qimg_height || !g_orig_draw_image_rr) {
+        return false;
+    }
+
+    auto* src_bytes = static_cast<uint8_t*>(src_disp);
+    auto* dst_bytes = static_cast<uint8_t*>(dst_disp);
+
+    void* const* src_vtable = *reinterpret_cast<void* const* const*>(src_bytes);
+    void* const* dst_vtable = *reinterpret_cast<void* const* const*>(dst_bytes);
+    if (!src_vtable || !dst_vtable) {
+        return false;
+    }
+
+    // src_disp must be Table 1 (OPALRasterDisp, 0x68B) with valid BlitCopy (+0x90) and DrawImage (+0xA0).
+    // dst_disp may be either Table 0 (LUXViewDisp, 0x40B window display, where +0x90 is nullptr and
+    // +0x38 is out-of-bounds) or Table 1 (OPALRasterDisp, 0x68B offscreen display); both share the
+    // exact same OPALDisp::DrawImage pointer at vtable[0xA0 / 8].
+    const auto* blit_code = reinterpret_cast<const uint8_t*>(src_vtable[0x90 / 8]);
+    const auto* draw_img_code = reinterpret_cast<const uint8_t*>(src_vtable[0xA0 / 8]);
+    if (!IsInFrontText(blit_code, 0, 16) || !IsInFrontText(draw_img_code, 0, 16) ||
+        dst_vtable[0xA0 / 8] != src_vtable[0xA0 / 8]) {
+        return false;
+    }
+
+    // src_disp must be QImage-backed (is_bitmap == 0 at +0x38) with no active QPainter (+0x10).
+    // On dst_disp, only check the base QPaintDevice* slot (+0x08); never read dst_bytes[0x38].
+    if (src_bytes[0x38] != 0 ||
+        *reinterpret_cast<void* const*>(src_bytes + 0x10) != nullptr ||
+        *reinterpret_cast<const void* const*>(dst_bytes + 0x08) == nullptr) {
+        return false;
+    }
+
+    void* src_qimg = *reinterpret_cast<void**>(src_bytes + 0x08);
+    if (!IsQImageDevice(src_qimg)) {
+        return false;
+    }
+
+    const double src_dpr = GetImageDpr(src_qimg);
+    if (src_dpr <= 1.001) {
+        return false;
+    }
+
+    const int src_pw = g_orig_qimg_width(src_qimg);
+    const int src_ph = g_orig_qimg_height(src_qimg);
+    if (src_pw <= 0 || src_ph <= 0) {
+        return false;
+    }
+
+    const int rot_pw = ScaleByDpr(dst_w, src_dpr);
+    const int rot_ph = ScaleByDpr(dst_h, src_dpr);
+    if (rot_pw <= 0 || rot_ph <= 0) {
+        return false;
+    }
+
+    const int copy_pw = (src_pw < rot_ph) ? src_pw : rot_ph;
+    const int copy_ph = (src_ph < rot_pw) ? src_ph : rot_pw;
+    if (copy_pw <= 0 || copy_ph <= 0) {
+        return false;
+    }
+
+    const bool use_scanline = (g_qimg_const_scanline != nullptr && g_qimg_format != nullptr) &&
+                              (g_qimg_format(src_qimg) == 4 || g_qimg_format(src_qimg) == 5);
+    if (!use_scanline && !g_orig_qimg_pixel) {
+        return false;
+    }
+
+    alignas(16) uint8_t rot_qimg[64] = {};
+    g_orig_qimg_ctor_wh(rot_qimg, rot_pw, rot_ph, 5 /* QImage::Format_ARGB32 */);
+    g_qimg_set_dpr(rot_qimg, src_dpr);
+
+    uint8_t* dst_base = g_qimg_scanline(rot_qimg, 0);
+    if (!dst_base) {
+        g_qimg_dtor(rot_qimg);
+        return false;
+    }
+    ptrdiff_t dst_stride = 0;
+    if (rot_ph > 1) {
+        uint8_t* dst_row1 = g_qimg_scanline(rot_qimg, 1);
+        if (!dst_row1) {
+            g_qimg_dtor(rot_qimg);
+            return false;
+        }
+        dst_stride = dst_row1 - dst_base;
+    }
+
+    if (copy_pw < rot_ph || copy_ph < rot_pw) {
+        for (int ry = 0; ry < rot_ph; ++ry) {
+            auto* drow = reinterpret_cast<uint32_t*>(dst_base + static_cast<ptrdiff_t>(ry) * dst_stride);
+            for (int rx = 0; rx < rot_pw; ++rx) {
+                drow[rx] = 0u;
+            }
+        }
+    }
+
+    if (use_scanline) {
+        for (int py = 0; py < copy_ph; ++py) {
+            const auto* srow = reinterpret_cast<const uint32_t*>(g_qimg_const_scanline(src_qimg, py));
+            if (!srow) {
+                g_qimg_dtor(rot_qimg);
+                return false;
+            }
+            if (!rot_cw) {
+                for (int px = 0; px < copy_pw; ++px) {
+                    auto* drow = reinterpret_cast<uint32_t*>(
+                        dst_base + static_cast<ptrdiff_t>(rot_ph - 1 - px) * dst_stride);
+                    drow[py] = srow[px] | 0xFF000000u;
+                }
+            } else {
+                const int rx = rot_pw - 1 - py;
+                for (int px = 0; px < copy_pw; ++px) {
+                    auto* drow = reinterpret_cast<uint32_t*>(
+                        dst_base + static_cast<ptrdiff_t>(px) * dst_stride);
+                    drow[rx] = srow[px] | 0xFF000000u;
+                }
+            }
+        }
+    } else {
+        for (int py = 0; py < copy_ph; ++py) {
+            for (int px = 0; px < copy_pw; ++px) {
+                const uint32_t pix = g_orig_qimg_pixel(src_qimg, px, py) | 0xFF000000u;
+                if (!rot_cw) {
+                    auto* drow = reinterpret_cast<uint32_t*>(
+                        dst_base + static_cast<ptrdiff_t>(rot_ph - 1 - px) * dst_stride);
+                    drow[py] = pix;
+                } else {
+                    auto* drow = reinterpret_cast<uint32_t*>(
+                        dst_base + static_cast<ptrdiff_t>(px) * dst_stride);
+                    drow[rot_pw - 1 - py] = pix;
+                }
+            }
+        }
+    }
+
+    *reinterpret_cast<void**>(src_bytes + 0x08) = rot_qimg;
+    reinterpret_cast<FnOpalBlitCopy>(src_vtable[0x90 / 8])(
+        src_disp, 0, 0, dst_disp, dst_x, dst_y, dst_w, dst_h);
+    *reinterpret_cast<void**>(src_bytes + 0x08) = src_qimg;
+
+    g_qimg_dtor(rot_qimg);
+    return true;
+}
+
+// Site 1 (Modo 16 +0x1F6BA0, Modo 17 +0xD0EDE0): standalone 90 deg CCW tab blit helper.
+static void HookTabBlitCCW(
+    const void* tab_ctrl,
+    void*       dst_disp,
+    void*       src_disp,
+    int         src_w,
+    int         src_h,
+    int         offset)
+{
+    if (IsHighDpiActive() && tab_ctrl && dst_disp && src_disp && src_w > 0 && src_h > 0) {
+        const auto* tc = static_cast<const uint8_t*>(tab_ctrl);
+        const int32_t vertical_flag = *reinterpret_cast<const int32_t*>(tc + 0x37C);
+        const int32_t orient_mode   = *reinterpret_cast<const int32_t*>(tc + 0x380);
+        if (vertical_flag != 0 && orient_mode == 0) {
+            if (BlitRotatedDisplayRef(/*rot_cw=*/false, src_disp, dst_disp, offset, 0, src_h, src_w)) {
+                return;
+            }
+        }
+    }
+    g_orig_tab_blit_ccw(tab_ctrl, dst_disp, src_disp, src_w, src_h, offset);
+}
+
+// Site 2 (Modo 16 +0x19733C, Modo 17 +0xCF0683): 90 deg CW tab rotation tail block helper.
+static int TabRotateCWHelper(
+    void*          src_disp,
+    void*          dst_disp,
+    const uint8_t* comp_rbx,
+    int            dst_x,
+    int            dst_y)
+{
+    if (!comp_rbx) return 0;
+    const int dst_w = *reinterpret_cast<const int*>(comp_rbx + 0x4C);
+    const int dst_h = *reinterpret_cast<const int*>(comp_rbx + 0x50);
+    return BlitRotatedDisplayRef(/*rot_cw=*/true, src_disp, dst_disp, dst_x, dst_y, dst_w, dst_h) ? 1 : 0;
+}
+
+static void UnregisterTabRotateCWUnwind() {
+    if (g_cw_unwind_registered) {
+        RtlDeleteFunctionTable(&g_cw_unwind_rf);
+        g_cw_unwind_rf = {};
+        g_cw_unwind_registered = false;
+    }
+}
+
+// Build x64 near-call stub with registered Windows x64 UNWIND_INFO for Site 2 (90 deg CW tail block).
+// Invoked via `call cw_stub` at p_cw + 0 (originally `call ORastCreateImage`), where caller RSP % 16 == 0
+// (so stub entry RSP % 16 == 8), rdi = src_disp, [caller_rsp + dst_disp_off] = dst_disp,
+// rbx = component struct (+0x4C = dst_w, +0x50 = dst_h), ebp = dst_x, r12d = dst_y.
+// Returns to p_cw + 5 (`test ecx, ecx; jz p_destroy; nop`) with ecx == 0 on High-DPI success, or
+// executes the displaced 14-byte sequence and returns with rax = ILxImage*, r8d = [rbx + 0x50], ecx = 4.
+static uint8_t* BuildTabRotateCWStub(
+    const uint8_t* p_cw,
+    void*          orig_orast_create_img,
+    uint32_t       dst_disp_off)
+{
+    uint8_t buf[88] = {};
+    size_t c = 0;
+
+    // +0x00 (4B): sub rsp, 0x28 (32B shadow space + 8B 5th stack arg, keeps RSP % 16 == 0)
+    buf[c++] = 0x48; buf[c++] = 0x83; buf[c++] = 0xEC; buf[c++] = 0x28;
+    // +0x04 (3B): mov rcx, rdi (src_disp)
+    buf[c++] = 0x48; buf[c++] = 0x8B; buf[c++] = 0xCF;
+    // +0x07 (8B): mov rdx, qword ptr [rsp + (0x30 + dst_disp_off)] (dst_disp; +0x28 frame + 0x08 return addr)
+    buf[c++] = 0x48; buf[c++] = 0x8B; buf[c++] = 0x94; buf[c++] = 0x24;
+    *reinterpret_cast<uint32_t*>(buf + c) = 0x30u + dst_disp_off;
+    c += 4;
+    // +0x0F (3B): mov r8, rbx (comp_rbx)
+    buf[c++] = 0x4C; buf[c++] = 0x8B; buf[c++] = 0xC3;
+    // +0x12 (3B): mov r9d, ebp (dst_x)
+    buf[c++] = 0x44; buf[c++] = 0x8B; buf[c++] = 0xCD;
+    // +0x15 (5B): mov dword ptr [rsp + 0x20], r12d (dst_y)
+    buf[c++] = 0x44; buf[c++] = 0x89; buf[c++] = 0x64; buf[c++] = 0x24; buf[c++] = 0x20;
+    // +0x1A (10B): movabs rax, &TabRotateCWHelper
+    buf[c++] = 0x48; buf[c++] = 0xB8;
+    *reinterpret_cast<uintptr_t*>(buf + c) = reinterpret_cast<uintptr_t>(&TabRotateCWHelper);
+    c += 8;
+    // +0x24 (2B): call rax
+    buf[c++] = 0xFF; buf[c++] = 0xD0;
+    // +0x26 (2B): test eax, eax
+    buf[c++] = 0x85; buf[c++] = 0xC0;
+    // +0x28 (2B): jz .fallback (+7 bytes -> +0x31)
+    buf[c++] = 0x74; buf[c++] = 0x07;
+    // +0x2A (2B): xor ecx, ecx (ecx == 0 -> caller `test ecx, ecx; jz p_destroy` jumps to p_destroy)
+    buf[c++] = 0x33; buf[c++] = 0xC9;
+    // +0x2C (5B): add rsp, 0x28; ret (canonical x64 epilog)
+    buf[c++] = 0x48; buf[c++] = 0x83; buf[c++] = 0xC4; buf[c++] = 0x28;
+    buf[c++] = 0xC3;
+
+    // .fallback (+0x31): execute displaced instructions from p_cw + 0..13
+    // +0x31 (3B): mov rcx, rdi
+    buf[c++] = 0x48; buf[c++] = 0x8B; buf[c++] = 0xCF;
+    // +0x34 (10B): movabs rax, orig_orast_create_img
+    buf[c++] = 0x48; buf[c++] = 0xB8;
+    *reinterpret_cast<uintptr_t*>(buf + c) = reinterpret_cast<uintptr_t>(orig_orast_create_img);
+    c += 8;
+    // +0x3E (2B): call rax (returns ILxImage* in rax)
+    buf[c++] = 0xFF; buf[c++] = 0xD0;
+    // +0x40 (4B): mov r8d, dword ptr [rbx + 0x50]
+    buf[c++] = 0x44; buf[c++] = 0x8B; buf[c++] = 0x43; buf[c++] = 0x50;
+    // +0x44 (5B): mov ecx, 4 (non-zero -> caller `test ecx, ecx; jz p_destroy` falls through to p_cw + 14)
+    buf[c++] = 0xB9; buf[c++] = 0x04; buf[c++] = 0x00; buf[c++] = 0x00; buf[c++] = 0x00;
+    // +0x49 (5B): add rsp, 0x28; ret (canonical x64 epilog)
+    buf[c++] = 0x48; buf[c++] = 0x83; buf[c++] = 0xC4; buf[c++] = 0x28;
+    buf[c++] = 0xC3;
+
+    // +0x4E (2B): align UNWIND_INFO to 4-byte offset 0x50
+    buf[c++] = 0xCC;
+    buf[c++] = 0xCC;
+
+    // +0x50 (8B): Windows x64 UNWIND_INFO (Version=1, Flags=0, SizeOfProlog=4, CountOfCodes=1,
+    // UWOP_ALLOC_SMALL (2) with OpInfo = (0x28 - 8) / 8 = 4 -> 0x42, + 1 even-slot pad).
+    buf[c++] = 0x01;
+    buf[c++] = 0x04;
+    buf[c++] = 0x01;
+    buf[c++] = 0x00;
+    buf[c++] = 0x04;
+    buf[c++] = 0x42;
+    buf[c++] = 0x00;
+    buf[c++] = 0x00;
+
+    uint8_t* stub = AllocNearExecStub(p_cw, buf, c);
+    if (!stub) return nullptr;
+
+    UnregisterTabRotateCWUnwind();
+    g_cw_unwind_rf.BeginAddress = 0;
+    g_cw_unwind_rf.EndAddress   = 0x4Eu;
+    g_cw_unwind_rf.UnwindData   = 0x50u;
+    if (!RtlAddFunctionTable(&g_cw_unwind_rf, 1, reinterpret_cast<DWORD64>(stub))) {
+        g_cw_unwind_rf = {};
+        return nullptr;
+    }
+    g_cw_unwind_registered = true;
+    return stub;
 }
 
 static constexpr uint8_t kSigOpalFillRect[]  = { 0x48, 0x8D, 0x4C, 0x24, 0x38, 0xFF, 0x15 };
@@ -2036,9 +2178,9 @@ static int64_t HookRendWinMouseEvent(void* a1, void* a2, void* a3, void* a4) {
     return g_orig_rw_mouse_event(a1, a2, a3, a4);
 }
 
-static int HookRendWinScrollbarGet(void* a1, int a2, int a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
+static int HookRendWinScrollbarGet(void* a1, int a2, int a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9) {
     ScopedRendWinLogicalZoom scope;
-    return g_orig_rw_scrollbar_get(a1, a2, a3, a4, a5, a6, a7, a8);
+    return g_orig_rw_scrollbar_get(a1, a2, a3, a4, a5, a6, a7, a8, a9);
 }
 
 static int HookRendWinGetScaleAndOffset(void* a1, void* a2, void* a3, void* a4) {
@@ -2494,6 +2636,48 @@ static bool PatchRelCall(uint8_t* call_insn, Fn dst_fn) {
     return PatchCodeBytes(call_insn, patch, sizeof(patch));
 }
 
+// Patch the 14-byte sequence at p_cw (`call ORastCreateImage; mov r8d, [rbx+0x50]; mov ecx, 4`)
+// with `call cw_stub; test ecx, ecx; jz p_destroy; nop`, preserving balanced CALL/RET semantics
+// and registered Windows x64 .pdata unwind metadata across nested Qt/Modo calls.
+static bool InstallTabRotateCWHook(
+    uint8_t* p_cw,
+    void*    orig_orast_create_img,
+    uint8_t* p_destroy,
+    uint32_t dst_disp_off)
+{
+    if (!p_cw || !orig_orast_create_img || !p_destroy ||
+        !IsWithinRel32(p_cw + 13, reinterpret_cast<uintptr_t>(p_destroy))) {
+        return false;
+    }
+    uint8_t* cw_stub = BuildTabRotateCWStub(p_cw, orig_orast_create_img, dst_disp_off);
+    if (!cw_stub || !IsWithinRel32(p_cw + 5, reinterpret_cast<uintptr_t>(cw_stub))) {
+        UnregisterTabRotateCWUnwind();
+        return false;
+    }
+
+    uint8_t site_patch[14] = {};
+    // +0..+4 (5B): call cw_stub
+    site_patch[0] = 0xE8;
+    *reinterpret_cast<int32_t*>(site_patch + 1) = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(cw_stub) - reinterpret_cast<intptr_t>(p_cw + 5));
+    // +5..+6 (2B): test ecx, ecx
+    site_patch[5] = 0x85;
+    site_patch[6] = 0xC9;
+    // +7..+12 (6B): jz p_destroy
+    site_patch[7] = 0x0F;
+    site_patch[8] = 0x84;
+    *reinterpret_cast<int32_t*>(site_patch + 9) = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(p_destroy) - reinterpret_cast<intptr_t>(p_cw + 13));
+    // +13 (1B): nop (falls through to p_cw + 14: `mov edx, [rbx + 0x4c]`)
+    site_patch[13] = 0x90;
+
+    if (!PatchCodeBytes(p_cw, site_patch, sizeof(site_patch))) {
+        UnregisterTabRotateCWUnwind();
+        return false;
+    }
+    return true;
+}
+
 static void InstallAllHooks() {
     if (g_hooked) return;
 
@@ -2543,6 +2727,8 @@ static void InstallAllHooks() {
     BindExport(qtgui, "??0QImage@@QEAA@AEBV0@@Z",                                   g_qimg_copy_ctor);
     BindExport(qtgui, "??1QImage@@UEAA@XZ",                                         g_qimg_dtor);
     BindExport(qtgui, "?scanLine@QImage@@QEAAPEAEH@Z",                              g_qimg_scanline);
+    BindExport(qtgui, "?constScanLine@QImage@@QEBAPEBEH@Z",                         g_qimg_const_scanline);
+    BindExport(qtgui, "?format@QImage@@QEBA?AW4Format@1@XZ",                        g_qimg_format);
     BindExport(qtgui, "?setPointSizeF@QFont@@QEAAXN@Z",                             g_qfont_set_pt_f);
     BindExport(qtgui, "?pointSizeF@QFont@@QEBANXZ",                                 g_qfont_get_pt_f);
     BindExport(qtgui, "??0QPixmap@@QEAA@AEBV0@@Z",                                  g_qpixmap_copy_ctor);
@@ -2662,24 +2848,67 @@ static void InstallAllHooks() {
         }
     }
 
-    // Rotated vertical tab strip call sites (90 deg CCW and CW)
+    // Stateless High-DPI rotated vertical tab strip hooks (90 deg CCW and 90 deg CW)
     static const uint8_t pat_ccw[31] = {
         0x48, 0x8B, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
         0x4C, 0x8B, 0xC0, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
         0xB9, 0x01, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0xF0
     };
+    static const uint8_t pat_ccw_prol[20] = {
+        0x44, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44, 0x24, 0x18,
+        0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08
+    };
+    static const uint8_t pat_ccw_cmp1[7] = { 0x83, 0xB8, 0x7C, 0x03, 0x00, 0x00, 0x00 };
+    static const uint8_t pat_ccw_cmp2[7] = { 0x83, 0xB8, 0x80, 0x03, 0x00, 0x00, 0x00 };
+
     static const uint8_t pat_cw[17] = {
         0xE8, 0, 0, 0, 0, 0x44, 0x8B, 0x43, 0x50, 0xB9, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x53, 0x4C
     };
+    static const uint8_t pat_cw_unrot[37] = {
+        0x8B, 0x43, 0x50, 0x45, 0x33, 0xC0,
+        0x4C, 0x8B, 0x8C, 0x24, 0, 0, 0, 0,
+        0x33, 0xD2, 0x89, 0x44, 0x24, 0x38,
+        0x8B, 0x43, 0x4C, 0x89, 0x44, 0x24, 0x30,
+        0x44, 0x89, 0x64, 0x24, 0x28, 0x89, 0x6C, 0x24, 0x20,
+        0xE8
+    };
+    static const uint8_t pat_cw_destroy[4] = { 0x48, 0x8B, 0xCF, 0xE8 };
+
     uint8_t* p_ccw = FindCodePattern(front, is_modo16 ? 0x1F6C05 : 0xD0EE45, pat_ccw, "xxxxxxxxx????xxxxxx????xxxxxxxx", sizeof(pat_ccw));
-    uint8_t* p_cw  = FindCodePattern(front, is_modo16 ? 0x19733C : 0xCF0683, pat_cw,  "x????xxxxxxxxxxxx", sizeof(pat_cw));
-    if (p_ccw) {
-        g_ret_rot_ccw = p_ccw + 13;
-        g_rot_ccw_end = GetFunctionEndOrFallback(g_ret_rot_ccw);
+    if (p_ccw && IsInFrontText(p_ccw, 0x65, sizeof(pat_ccw))) {
+        uint8_t* p_fn_ccw = p_ccw - 0x65;
+        if (MatchPattern(p_fn_ccw,        pat_ccw_prol, nullptr, sizeof(pat_ccw_prol)) &&
+            MatchPattern(p_fn_ccw + 0x4B, pat_ccw_cmp1, nullptr, sizeof(pat_ccw_cmp1)) &&
+            MatchPattern(p_fn_ccw + 0x58, pat_ccw_cmp2, nullptr, sizeof(pat_ccw_cmp2))) {
+            g_orig_tab_blit_ccw = BuildCleanTrampoline<FnTabBlitCCW>(p_fn_ccw, 15);
+            if (g_orig_tab_blit_ccw) {
+                PatchJump14(p_fn_ccw, &HookTabBlitCCW);
+            }
+        }
     }
-    if (p_cw) {
-        g_ret_rot_cw  = p_cw + 5;
-        g_rot_cw_end  = GetFunctionEndOrFallback(g_ret_rot_cw);
+
+    uint8_t* p_cw = FindCodePattern(front, is_modo16 ? 0x19733C : 0xCF0683, pat_cw, "x????xxxxxxxxxxxx", sizeof(pat_cw));
+    if (p_cw && IsInFrontText(p_cw, 6, sizeof(pat_cw)) &&
+        p_cw[-6] == 0x0F && p_cw[-5] == 0x84) {
+        void* orig_orast_create_img = ResolveRelCallTarget(p_cw);
+        int32_t unrot_disp = *reinterpret_cast<const int32_t*>(p_cw - 4);
+        if (IsInFrontText(reinterpret_cast<const uint8_t*>(orig_orast_create_img), 0, 16) &&
+            unrot_disp > 14 && unrot_disp < 0x200) {
+            uint8_t* p_unrot = p_cw + unrot_disp;
+            if (IsInFrontText(p_unrot, 2, sizeof(pat_cw_unrot)) &&
+                p_unrot[-2] == 0xEB &&
+                MatchPattern(p_unrot, pat_cw_unrot, "xxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxx", sizeof(pat_cw_unrot))) {
+                int8_t destroy_disp = *reinterpret_cast<const int8_t*>(p_unrot - 1);
+                uint32_t dst_disp_off = *reinterpret_cast<const uint32_t*>(p_unrot + 10);
+                if (destroy_disp > 0 && dst_disp_off >= 0x40u && dst_disp_off <= 0x400u) {
+                    uint8_t* p_destroy = p_unrot + destroy_disp;
+                    if (IsInFrontText(p_destroy, 0, sizeof(pat_cw_destroy)) &&
+                        MatchPattern(p_destroy, pat_cw_destroy, nullptr, sizeof(pat_cw_destroy))) {
+                        InstallTabRotateCWHook(p_cw, orig_orast_create_img, p_destroy, dst_disp_off);
+                    }
+                }
+            }
+        }
     }
 
     // Problem 6(a): Resolve FireLazyHandlers address before NOPing out the mid-paint call
@@ -3235,11 +3464,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             }
             g_ldr_cookie = nullptr;
         }
-        if (g_rot_buf != nullptr) {
-            VirtualFree(g_rot_buf, 0, MEM_RELEASE);
-            g_rot_buf = nullptr;
-            g_rot_cap = 0;
-        }
+        UnregisterTabRotateCWUnwind();
         FreeFboTable();
     }
     return TRUE;
