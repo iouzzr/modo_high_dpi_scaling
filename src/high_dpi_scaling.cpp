@@ -14,9 +14,9 @@
 #pragma intrinsic(_ReturnAddress)
 
 // Headerless POD ABI mirrors for Qt value types:
-// - QSizeC (2 ints) matches QSize and QPoint (reused in FnDrawPoints).
-// - QRectC (4 ints) matches QRect (closed interval: x2 = x + w - 1, y2 = y + h - 1)
-//   and QLine (x1, y1, x2, y2, reused in FnDrawLines).
+// - QSizeC (2 ints): QSize and QPoint (reused in FnDrawPoints).
+// - QRectC (4 ints): QRect (closed interval: x2 = x + w - 1, y2 = y + h - 1) and QLine (reused in FnDrawLines).
+// - DpiPairC (2 doubles): QPair<double,double> (Qt5) / std::pair<double,double> (Qt6).
 struct QSizeC {
     int w;
     int h;
@@ -91,6 +91,8 @@ typedef void           (*FnQImageDtor)(void* this_ptr);
 typedef uint8_t*       (*FnQImageScanLine)(void* this_ptr, int row);
 typedef const uint8_t* (*FnQImageConstScanLine)(const void* this_ptr, int row);
 typedef int            (*FnQImageFormat)(const void* this_ptr);
+// C++ return types with user-declared ctors or size > 8B (QSize, QImage, QPair/std::pair) use MSVC x64's
+// hidden sret pointer (RDX for member functions, RCX for static), unlike <=8B PODs returned in RAX.
 typedef QSizeC*        (*FnQImageSize)(const void* this_ptr, QSizeC* out_sz);
 typedef void*          (*FnQImageCopy)(const void* this_ptr, void* out_img, int x, int y, int w, int h);
 typedef uint32_t       (*FnQImagePixel)(const void* this_ptr, int x, int y);
@@ -111,14 +113,14 @@ typedef void           (*FnFontSetPointSizeF)(void* font_ptr, double pt);
 typedef double         (*FnFontPointSizeF)(const void* font_ptr);
 typedef void           (*FnSetDpr)(void* this_ptr, double dpr);
 typedef double         (*FnGetDpr)(const void* this_ptr);
-typedef DpiPairC*      (*FnOverrideDpi)(DpiPairC* out_pair, const DpiPairC* in_pair);
+typedef DpiPairC*      (*FnOverrideDpi)(DpiPairC* out_pair, const DpiPairC* in_pair); // sret in RCX
 
 // QApplication / QObject / QWidget / QLabel / QPixmap / QScrollArea types
 typedef bool           (*FnAppNotify)(void* app, void* receiver, void* ev);
 typedef const char*    (*FnMetaClassName)(const void* meta_obj);
 typedef void           (*FnWidgetUpdate)(void* widget);
 typedef void*          (*FnWidgetParent)(const void* widget);
-typedef QSizeC*        (*FnWidgetSize)(const void* widget, QSizeC* out_sz);
+typedef QSizeC*        (*FnWidgetSize)(const void* widget, QSizeC* out_sz);            // sret in RDX
 typedef void*          (*FnScrollAreaWidget)(const void* scroll_area);
 typedef void*          (*FnQPixmapCopyCtor)(void* dst_pixmap, const void* src_pixmap);
 typedef void           (*FnQPixmapDtor)(void* pixmap);
@@ -237,7 +239,6 @@ static RUNTIME_FUNCTION               g_cw_unwind_rf              = {};
 static bool                           g_cw_unwind_registered      = false;
 
 static double*                    g_rendwin_zoom              = nullptr;
-static void**                     g_rendwin_pane_ptr          = nullptr;
 static int*                       g_rw_wipe_mode              = nullptr;
 static int*                       g_rw_spotlight_mx           = nullptr;
 static int*                       g_rw_spotlight_my           = nullptr;
@@ -402,6 +403,8 @@ static double GetCurrentGLDpr() {
     return g_scale;
 }
 
+// WPane + 0xD8 -> GL sub-struct: +0x10 context info (+0x04 initialized flag),
+// +0x18 LUXQt::LUXGLWidget*, +0x20 QOpenGLFramebufferObject*.
 static double GetPaneDpr(const uint8_t* pane) {
     if (!g_pmv2_mode) return g_scale;
     if (pane && g_qpd_get_dpr) {
@@ -421,7 +424,7 @@ static double GetPaneDpr(const uint8_t* pane) {
 }
 
 // ============================================================================
-// Executable Trampoline & Codecave Arena (W^X: RX at rest, temporary RWX write)
+// Executable Trampoline & Codecave Arena (RX at rest, temporary RWX during stub write)
 // ============================================================================
 
 static uint8_t* g_exec_arena = nullptr;
@@ -541,6 +544,7 @@ static bool IsWithinRel32(const uint8_t* next_ip, uintptr_t dst) {
     return diff >= -2147483648LL && diff <= 2147483647LL;
 }
 
+// Allocate RX stub memory on 64KB VirtualAlloc granularity within +/-2GB rel32 reach of 5-byte E8 CALL patches.
 static uint8_t* AllocNearExecStub(const uint8_t* near_addr, const uint8_t* code, size_t len) {
     size_t aligned = (len + 15u) & ~static_cast<size_t>(15u);
     if (g_near_arena && g_near_used + aligned <= g_near_cap &&
@@ -758,9 +762,10 @@ static void FreeFboTable() {
 }
 
 // ============================================================================
-// Qt Meta-Object Helpers & QApplication::notify / LUXView Hooks (Problems 5 & 6a)
+// Qt Meta-Object Helpers & QApplication::notify / LUXView Hooks
 // ============================================================================
 
+// QObject vtable layout (Qt5 & Qt6): vtable[0] = metaObject(), vtable[1] = qt_metacast(const char*).
 static void* QtMetaCast(void* qobj, const char* class_name) {
     if (!qobj || !class_name) return nullptr;
     void* const* vtable = *reinterpret_cast<void* const* const*>(qobj);
@@ -801,6 +806,7 @@ static void HookLUXViewUpdateImage(void* lux_view) {
         double live_dpr = GetWidgetDpr(lux_view);
         g_active_ui_dpr = live_dpr;
         if (g_pmv2_mode) {
+            // LUXView::m_image (QImage) sits at +0x48 in M16 (Qt5) and +0x40 in M17 (Qt6).
             const void* m_img = reinterpret_cast<const uint8_t*>(lux_view) + (g_is_modo16 ? 0x48 : 0x40);
             double img_dpr = GetImageDpr(m_img);
             if (AbsDouble(img_dpr - live_dpr) > 0.005) {
@@ -818,10 +824,10 @@ static void HookLUXViewUpdateImage(void* lux_view) {
 }
 
 // QApplication::notify hook:
-// 1. Problem 6(a): Flush FireLazyHandlers(3, nullptr) at top-level UpdateRequest (77)
-//    or Expose (206) BEFORE Qt locks QBackingStore and caches QPaintEngine* on the stack.
-// 2. Problem 5: Track per-widget/per-window live DPR on the main thread and handle
-//    QEvent::ScreenChangeInternal (214) for LUXQt::LUXGLWidget and LUXQt::LUXView.
+// 1. Flush FireLazyHandlers(3, nullptr) at top-level UpdateRequest (77) / Expose (206) before
+//    painting: running it inside LUXView::paintEvent can resize widgets mid-paint, reallocating
+//    QBackingStore's QImage and freeing QPaintEngine* cached on QWidgetPrivate::drawWidget's stack (UAF).
+// 2. Track live main-thread DPR and handle ScreenChangeInternal (214) / Show (17) on Modo views.
 static bool HookAppNotify(void* app, void* receiver, void* ev) {
     if (!ev || !g_orig_app_notify) {
         return g_orig_app_notify ? g_orig_app_notify(app, receiver, ev) : false;
@@ -851,6 +857,7 @@ static bool HookAppNotify(void* app, void* receiver, void* ev) {
         }
     }
 
+    // Include QEvent::Paint (12) in g_paint_tx_depth to block re-entrant lazy flushes during nested paints.
     const bool is_paint_tx = (ev_type == 77 || ev_type == 206 || ev_type == 12);
     if (is_paint_tx) {
         if (g_paint_tx_depth == 0 && (ev_type == 77 || ev_type == 206) && g_fire_lazy_handlers) {
@@ -871,6 +878,7 @@ static bool HookAppNotify(void* app, void* receiver, void* ev) {
                 double live_dpr = GetWidgetDpr(receiver);
                 g_active_ui_dpr = live_dpr;
                 const auto* glw_bytes = static_cast<const uint8_t*>(receiver);
+                // Owning WPane* sits at +0x78 in M16 and +0x80 in M17.
                 const auto* pane = *reinterpret_cast<const uint8_t* const*>(
                     glw_bytes + (g_is_modo16 ? 0x78 : 0x80));
                 const auto* sub = pane
@@ -942,6 +950,8 @@ static void HookFboDtor(void* this_ptr) {
     g_orig_fbo_dtor(this_ptr);
 }
 
+// Return logical dimensions for Modo's camera/picking math, or 0 on forced recreate / PMv2 DPR
+// mismatch so Modo's `fbo->width() != pane_w` check reallocates at the new monitor's physical DPR.
 static int HookFboWidth(const void* this_ptr) {
     const bool is_main = (GetCurrentThreadId() == g_main_tid);
     if (g_force_recreate_fbo && this_ptr == g_force_recreate_fbo && is_main) {
@@ -982,6 +992,9 @@ static int HookFboHeight(const void* this_ptr) {
     return ph;
 }
 
+// nullptr means the window's default framebuffer (GetCurrentGLDpr()), whereas non-null untracked
+// FBOs (e.g. USD Hydra or HookAGLCaptureView's Tier-2 tmp_fbo) stay at 1.0x.
+// QRect stores closed-interval x2/y2, so right/bottom edges scale via ScaleByDpr(edge + 1, dpr) - 1.
 static void HookFboBlit(void* target, const QRectC* tr, void* source, const QRectC* sr, uint32_t buffers, uint32_t filter) {
     if (!IsHighDpiActive() || !tr || !sr) {
         g_orig_fbo_blit(target, tr, source, sr, buffers, filter);
@@ -1035,6 +1048,8 @@ static void ScaleGLBox(int x, int y, int w, int h, int* ox, int* oy, int* ow, in
     *oh = (h > 0) ? (ScaleByDpr(static_cast<int64_t>(y) + h, dpr) - py1) : ScaleByDpr(h, dpr);
 }
 
+// Modo 16 hooks AGLViewport/AGLScissor via frame3000.dll IAT (g_orig_*); Modo 17's 14-byte leaf
+// thunks have no room for a trampoline and dispatch via (*g_agl_table)[0xF0/8] and [0x460/8].
 static void HookViewport(int x, int y, int w, int h) {
     int px = 0, py = 0, pw = 0, ph = 0;
     ScaleGLBox(x, y, w, h, &px, &py, &pw, &ph);
@@ -1055,6 +1070,7 @@ static void HookScissor(int x, int y, int w, int h) {
     }
 }
 
+// Modo 16 WPaneGLGetPixelRatio (+0x1B8CB0) calls Qt5's integer devicePixelRatio(), truncating 1.25/1.5.
 static double HookWPaneGLGetPixelRatio(const uint8_t* pane) {
     return GetPaneDpr(pane);
 }
@@ -1078,6 +1094,8 @@ static bool IsHighDpiPainter(const void* painter) {
     return dev && IsQImageDevice(dev) && GetPaintDeviceDpr(dev) > 1.001;
 }
 
+// Only upscale Format_ARGB32 (5) backing surfaces from LUXView::updateImage (kSigUpdateImage)
+// and ORastCreate (kSigORastCreate), leaving icons, textures, and cursors at 1x.
 static void* HookQImageCtorSize(void* this_ptr, const QSizeC* sz, int fmt) {
     static constexpr uint8_t kSigUpdateImage[] = { 0x90, 0x48, 0x8B, 0xCF, 0xFF, 0x15 };
     double dpr = g_pmv2_mode ? g_active_ui_dpr : g_scale;
@@ -1107,6 +1125,8 @@ static void* HookQImageCtorWH(void* this_ptr, int w, int h, int fmt) {
     return g_orig_qimg_ctor_wh(this_ptr, w, h, fmt);
 }
 
+// Report logical dimensions to Modo's 2D layout, or -1 for g_force_recreate_qimg so
+// LUXView::updateImage reallocates m_image on cross-screen DPI changes.
 static QSizeC* HookQImageSize(const void* this_ptr, QSizeC* out_sz) {
     QSizeC* res = g_orig_qimg_size(this_ptr, out_sz);
     if (out_sz && g_force_recreate_qimg && this_ptr == g_force_recreate_qimg &&
@@ -1173,6 +1193,8 @@ static int HookQPaintDeviceHeight(const void* this_ptr) {
     return ph;
 }
 
+// QImage::copy and QImage::pixel operate in physical pixels even when dpr > 1; scale caller
+// logical coords to physical (propagating dpr in copy, clamping to physical bounds in pixel).
 static void* HookQImageCopy(const void* this_ptr, void* out_img, int x, int y, int w, int h) {
     if (IsHighDpiActive() && g_qimg_set_dpr) {
         double dpr = GetImageDpr(this_ptr);
@@ -1213,6 +1235,8 @@ static uint32_t HookQImagePixel(const void* this_ptr, int x, int y) {
     return g_orig_qimg_pixel(this_ptr, x, y);
 }
 
+// QPainter::drawImage scales targetRect by destination DPR, but interprets sourceRect (sr)
+// in physical QImage pixels.
 static void HookDrawImageRectRect(void* painter, const QRectC* tr, const void* img, const QRectC* sr, int flags) {
     if (IsHighDpiActive() && sr && img) {
         double dpr = GetImageDpr(img);
@@ -1235,6 +1259,8 @@ static void HookDrawImageRectRect(void* painter, const QRectC* tr, const void* i
     g_orig_draw_image_rr(painter, tr, img, sr, flags);
 }
 
+// Inside RendWinPaint, OPALDisp::BlitImage (kSigOpalBlitImage) blits a physical 1.0x render QImage
+// onto the High-DPI LUXView backing QImage; stamping g_rendwin_paint_dpr on a shallow copy blits 1:1.
 static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx, int sy, int sw, int sh, int flags) {
     static constexpr uint8_t kSigOpalBlitImage[] = {
         0x89, 0x7C, 0x24, 0x20, 0x44, 0x8B, 0xCE, 0x44, 0x8B, 0xC5
@@ -1258,9 +1284,9 @@ static void HookDrawImageXY(void* painter, int x, int y, const void* img, int sx
     g_orig_draw_image_xy(painter, x, y, img, sx, sy, sw, sh, flags);
 }
 
-// Stateless High-DPI 90-degree vertical tab rotation (90 deg CCW and 90 deg CW):
-// Rotates src_disp's physical QImage directly into a stack-local High-DPI QImage and blits
-// it onto dst_disp via OPALDisp::BlitCopy (src_vtable[0x90 / 8]), bypassing Modo's 1x ILxImage.
+// Stateless High-DPI 90-degree UI rotation (90 deg CCW Preset Browser group headers and
+// 90 deg CW vertical tab strips): rotates src_disp's physical QImage into a stack-local
+// High-DPI QImage and blits onto dst_disp via OPALDisp::BlitCopy, bypassing Modo's 1x ILxImage.
 static bool BlitRotatedDisplayRef(
     bool  rot_cw,
     void* src_disp,
@@ -1368,6 +1394,7 @@ static bool BlitRotatedDisplayRef(
         }
     }
 
+    // Force 0xFF alpha: ClearType rendering onto uninitialized ARGB32 scratch leaves non-opaque alpha.
     if (use_scanline) {
         for (int py = 0; py < copy_ph; ++py) {
             const auto* srow = reinterpret_cast<const uint32_t*>(g_qimg_const_scanline(src_qimg, py));
@@ -1407,6 +1434,7 @@ static bool BlitRotatedDisplayRef(
         }
     }
 
+    // Temporarily swap src_disp's QPaintDevice* (+0x08) to reuse OPALDisp::BlitCopy's clip/composition state.
     *reinterpret_cast<void**>(src_bytes + 0x08) = rot_qimg;
     reinterpret_cast<FnOpalBlitCopy>(src_vtable[0x90 / 8])(
         src_disp, 0, 0, dst_disp, dst_x, dst_y, dst_w, dst_h);
@@ -1416,7 +1444,8 @@ static bool BlitRotatedDisplayRef(
     return true;
 }
 
-// Site 1 (Modo 16 +0x1F6BA0, Modo 17 +0xD0EDE0): standalone 90 deg CCW tab blit helper.
+// Preset Browser (DirThumbBrowser) 90 deg CCW vertical group header blit (M16 +0x1F6BA0, M17 +0xD0EDE0):
+// tab_ctrl is DirThumbBrowser*: +0x37C = horizontal-scroll flag (!= 0), +0x380 = grid mode (== 0).
 static void HookTabBlitCCW(
     const void* tab_ctrl,
     void*       dst_disp,
@@ -1438,7 +1467,7 @@ static void HookTabBlitCCW(
     g_orig_tab_blit_ccw(tab_ctrl, dst_disp, src_disp, src_w, src_h, offset);
 }
 
-// Site 2 (Modo 16 +0x19733C, Modo 17 +0xCF0683): 90 deg CW tab rotation tail block helper.
+// Vertical tab strip 90 deg CW tab rotation helper (M16 +0x19733C, M17 +0xCF0683; +0x4C = dst_w, +0x50 = dst_h).
 static int TabRotateCWHelper(
     void*          src_disp,
     void*          dst_disp,
@@ -1460,7 +1489,7 @@ static void UnregisterTabRotateCWUnwind() {
     }
 }
 
-// Build x64 near-call stub with registered Windows x64 UNWIND_INFO for Site 2 (90 deg CW tail block).
+// Build x64 near-call stub with registered Windows x64 UNWIND_INFO for 90 deg CW vertical tab strip rotation.
 // Invoked via `call cw_stub` at p_cw + 0 (originally `call ORastCreateImage`), where caller RSP % 16 == 0
 // (so stub entry RSP % 16 == 8), rdi = src_disp, [caller_rsp + dst_disp_off] = dst_disp,
 // rbx = component struct (+0x4C = dst_w, +0x50 = dst_h), ebp = dst_x, r12d = dst_y.
@@ -1551,6 +1580,9 @@ static uint8_t* BuildTabRotateCWStub(
     return stub;
 }
 
+// OPAL sets both a 1px QPen and matching QBrush, shrinking FillRect's QRect by 1px for the pen stroke.
+// At High-DPI (especially 1.25/1.5), 1px QPen strokes cause hairline seams/dropouts; redirect OPAL
+// rects (restoring x2+1/y2+1), axis-aligned lines, and points to brush-based QPainter::fillRect.
 static constexpr uint8_t kSigOpalFillRect[]  = { 0x48, 0x8D, 0x4C, 0x24, 0x38, 0xFF, 0x15 };
 static constexpr uint8_t kSigOpalDrawLine[]  = { 0x48, 0x8B, 0x4B, 0x18, 0xFF, 0x15 };
 static constexpr uint8_t kSigOpalDrawPoint[] = { 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00 };
@@ -1621,6 +1653,7 @@ static void HookDrawPoint2(void* painter, int x, int y) {
     g_orig_draw_point2(painter, x, y);
 }
 
+// Scale logical setWindow dimensions to physical QImage pixels to prevent logical-vs-physical viewport rescale.
 static void HookPainterSetWindow(void* painter, int x, int y, int w, int h) {
     if (IsHighDpiActive() && painter && g_painter_device) {
         void* dev = g_painter_device(painter);
@@ -1635,6 +1668,7 @@ static void HookPainterSetWindow(void* painter, int x, int y, int w, int h) {
     g_orig_set_window(painter, x, y, w, h);
 }
 
+// Upgrade OPAL text NoAntialias (0x100) to PreferAntialias (0x80) on High-DPI surfaces.
 static void HookFontSetStyleStrategy(void* font_ptr, int strategy) {
     static constexpr uint8_t kSigOpalDrawText[] = {
         0x49, 0x8B, 0x17, 0x48, 0x8B, 0x4B, 0x18, 0xFF, 0x15
@@ -1647,6 +1681,9 @@ static void HookFontSetStyleStrategy(void* font_ptr, int strategy) {
     g_orig_font_style(font_ptr, strategy);
 }
 
+// 3D GL overlay font setup: kSigM16Dpr (int DPR imul) and kSigM17Dpr (cvttsd2si to setPointSize(int))
+// lose fractional scaling, so replace with setPointSizeF(base_pt * dpr); kSigLargeGl overwrites the
+// font with an unscaled 56pt (0x38) literal, so scale pt directly via setPointSizeF(pt * dpr).
 static void HookFontSetPointSize(void* font_ptr, int pt) {
     double dpr = GetCurrentGLDpr();
     if (IsHighDpiActive() && dpr > 1.001 && font_ptr && g_qfont_set_pt_f && g_qfont_get_pt_f) {
@@ -1676,7 +1713,7 @@ static void HookFontSetPointSize(void* font_ptr, int pt) {
 }
 
 // ============================================================================
-// 3. Problem 1: Stateless AGLCaptureView & WPaneGetPosition Pairing + Fallback
+// 3. Stateless AGLCaptureView & WPaneGetPosition Pairing + Fallback
 // ============================================================================
 
 static bool QueryPaneFboPhysicalSize(const uint8_t* pane, int lw, int lh, int* out_pw, int* out_ph, void*** out_fbo_slot = nullptr) {
@@ -1731,6 +1768,7 @@ static constexpr uint8_t kSigWPaneCapC3[9] = {
     0x8B, 0x44, 0x24, 0x50, 0x39, 0x45, 0x00, 0x0F, 0x85
 };
 
+// RendWin is a 2D LUXView/OPALDisp pane rather than an OpenGL WPane, so its DPR comes from disp_ref's QImage.
 static double QueryRendWinDpr() {
     if (!g_pmv2_mode) return g_scale;
     if (g_in_rendwin_paint && g_rendwin_paint_dpr >= 1.0 && g_rendwin_paint_dpr <= 4.0) {
@@ -1752,6 +1790,7 @@ static bool IsNativeCaptureWPaneCaller(const void* ret_addr) {
            MatchNexusReturnPattern(ret_addr, kSigWPaneCapC3, "xxxxxx?xx");
 }
 
+// RendWinUpdateImage and Fit-to-Window / zoom shortcut callers need physical (pw, ph) for 1:1 buffer sizing and Fit zoom.
 static constexpr uint8_t kSigWPaneFitToWin[16] = {
     0x66, 0x0F, 0x6E, 0x44, 0x24, 0x50, 0x66, 0x0F,
     0x6E, 0x5C, 0x24, 0x58, 0xF3, 0x0F, 0xE6, 0xC0
@@ -1830,6 +1869,7 @@ static void HookAGLCaptureView(void* agl_view, void* out_buf) {
         return;
     }
 
+    // agl_view + 0x10 -> AGLViewImpl* (+0x90/+0x94 = w/h, +0xD8 = WPane*).
     auto* impl = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(agl_view) + 0x10);
     if (!impl) {
         g_orig_agl_capture_view(agl_view, out_buf);
@@ -1880,7 +1920,7 @@ static void HookAGLCaptureView(void* agl_view, void* out_buf) {
         g_orig_fbo_ctor(tmp_fbo, lw, lh, fmt_buf);
         QRectC dst_r = { 0, 0, lw - 1, lh - 1 };
         QRectC src_r = { 0, 0, pw - 1, ph - 1 };
-        g_orig_fbo_blit(tmp_fbo, &dst_r, orig_fbo, &src_r, 0x4000u, 0x2601u);
+        g_orig_fbo_blit(tmp_fbo, &dst_r, orig_fbo, &src_r, 0x4000u /* GL_COLOR_BUFFER_BIT */, 0x2601u /* GL_LINEAR */);
         *fbo_slot = tmp_fbo;
         g_orig_agl_capture_view(agl_view, out_buf);
         *fbo_slot = orig_fbo;
@@ -1896,13 +1936,13 @@ static void HookAGLCaptureView(void* agl_view, void* out_buf) {
 }
 
 // ============================================================================
-// 4. Problem 3.1: Built-in Preview Viewport (IView / 'PREV') Native 1:1
+// 4. Built-in Preview Viewport (IView / 'PREV') Native 1:1
 // ============================================================================
 
 static double QueryIViewDpr(const void* iview) {
     if (!iview) return g_scale;
     const auto* iv = static_cast<const uint8_t*>(iview);
-    const auto* agl_view = *reinterpret_cast<const uint8_t* const*>(iv + 0x440);
+    const auto* agl_view = *reinterpret_cast<const uint8_t* const*>(iv + 0x440); // AGLView*
     if (agl_view) {
         const auto* impl = *reinterpret_cast<const uint8_t* const*>(agl_view + 0x10);
         if (impl) {
@@ -1915,6 +1955,9 @@ static double QueryIViewDpr(const void* iview) {
     return g_pmv2_mode ? g_active_ui_dpr : g_scale;
 }
 
+// Temporarily scale iview + 0x664/+0x668 (logical w/h) to physical pixels (guarded by g_iview_scaled_ptr
+// against re-entrancy). Bit 1 of iview + 0x3E8 indicates a 20px logical Preview header toolbar that Modo
+// subtracts internally before computing render height, hence ScaleByDpr(orig_h - 20, dpr) + 20.
 struct ScopedIViewPhysDims {
     uint8_t* iv;
     int      orig_w;
@@ -1975,9 +2018,12 @@ static int HookIViewCheckAutoRenderSize(void* iview) {
 }
 
 // ============================================================================
-// 5. Problem 3.2: Built-in 2D Tiled Image Viewer (ClipView) Mipmap Selection
+// 5. Built-in 2D Tiled Image Viewer (ClipView) Mipmap Selection
 // ============================================================================
 
+// ClipView struct (rbx): +0x148 = WPane*, +0x100 = float aspect (compared against xmm6).
+// Scale logical target thresholds (+0x130/+0x134 in Loop 1, +0x104/+0x108 in Loop 2) to physical
+// pixels so mipmap selection matches High-DPI screen resolution instead of stopping one mip early.
 static int ClipViewCheckThresholdImpl(const uint8_t* rbx, uint32_t lvl_w, uint32_t lvl_h, float ref_xmm6, size_t off_w, size_t off_h) {
     if (!rbx) return 0;
     double dpr = 1.0;
@@ -2070,7 +2116,7 @@ static uint8_t* BuildClipViewLoopStub(uint8_t* site, bool is_loop1) {
 }
 
 // ============================================================================
-// 6. Problem 3.3: Built-in F9 Render Window (RendWin) Native 1:1 & Picking
+// 6. Built-in F9 Render Window (RendWin) Native 1:1 & Picking
 // ============================================================================
 
 static double QueryDispRefDpr(const void* disp_ref) {
@@ -2121,6 +2167,7 @@ struct ScopedRendWinLogicalZoom {
     }
 };
 
+// Restore physical *g_rendwin_zoom before mutating zoom/image state when nested inside ScopedRendWinLogicalZoom.
 static void HookRendWinSetZoom(double zoom) {
     if (g_rw_zoom_depth > 0 && GetCurrentThreadId() == g_main_tid && g_rendwin_zoom) {
         *g_rendwin_zoom = g_rw_phys_zoom;
@@ -2178,6 +2225,7 @@ static int64_t HookRendWinMouseEvent(void* a1, void* a2, void* a3, void* a4) {
     return g_orig_rw_mouse_event(a1, a2, a3, a4);
 }
 
+// Must forward all 9 arguments: a9 is a mandatory stack output int* (omitting it crashes F9 Render Window).
 static int HookRendWinScrollbarGet(void* a1, int a2, int a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9) {
     ScopedRendWinLogicalZoom scope;
     return g_orig_rw_scrollbar_get(a1, a2, a3, a4, a5, a6, a7, a8, a9);
@@ -2203,6 +2251,7 @@ static int HookRendWinNormalizedToPane(double nx, double ny, void* out_x, void* 
     return g_orig_rw_norm_to_pane(nx, ny, out_x, out_y);
 }
 
+// Unscale physical ILxImage dimensions back to logical units for RendWin centering and split-wipe math.
 static int HookRendWinCenterImageGetSize(void* img, int* out_w, int* out_h) {
     int res = g_orig_image_get_size(img, out_w, out_h);
     if (IsHighDpiActive() && GetCurrentThreadId() == g_main_tid) {
@@ -2215,6 +2264,7 @@ static int HookRendWinCenterImageGetSize(void* img, int* out_w, int* out_h) {
     return res;
 }
 
+// Scale logical pane bounds to physical backing buffer dimensions for vignette blitting.
 static void HookRendWinBlitVignette(void* orast, void* img, int ox, int oy, int pane_w, int pane_h) {
     if (IsHighDpiActive() && g_in_rendwin_paint && GetCurrentThreadId() == g_main_tid &&
         g_rendwin_paint_dpr > 1.001) {
@@ -2224,6 +2274,7 @@ static void HookRendWinBlitVignette(void* orast, void* img, int ox, int oy, int 
     g_orig_rw_blit_vignette(orast, img, ox, oy, pane_w, pane_h);
 }
 
+// Spotlight wipe (*g_rw_wipe_mode == 1) compares against physical render pixels; scale cursor offset (mx - ox, my - oy) and radius.
 static void HookRendWinWipeBlit(void* orast, void* slot_b, int ox, int oy, int pane_w, int pane_h) {
     if (IsHighDpiActive() && g_in_rendwin_paint && GetCurrentThreadId() == g_main_tid &&
         g_rendwin_paint_dpr > 1.001 && g_rw_wipe_mode && *g_rw_wipe_mode == 1 &&
@@ -2246,7 +2297,7 @@ static void HookRendWinWipeBlit(void* orast, void* slot_b, int ox, int oy, int p
 }
 
 // ============================================================================
-// 7. Problem 3.4: Third-Party .lx Qt IPR Hooks (OctaneRender for Modo.lx, etc.)
+// 7. Third-Party .lx Qt IPR Hooks (OctaneRender for Modo.lx, etc.)
 // ============================================================================
 
 static constexpr uint32_t kMaxIprScrollAreas = 64;
@@ -2330,6 +2381,9 @@ static void* FindParentIprScrollArea(void* label) {
     return nullptr;
 }
 
+// Third-party IPR plugins (e.g. Octane) size renders from QScrollArea::size() and display a 1.0x QPixmap
+// in a child QLabel: HookLxQWidgetSize reports physical viewport size for 1:1 rendering, and
+// HookLxQLabelSetPixmap stamps target_dpr onto a shallow QPixmap copy so QLabel draws it 1:1 without 2x bloat.
 static void HookLxQLabelSetPixmap(void* label, const void* pixmap) {
     if (IsHighDpiActive() && label && pixmap &&
         g_qpixmap_get_dpr && g_qpixmap_set_dpr && g_qpixmap_copy_ctor && g_qpixmap_dtor) {
@@ -2535,6 +2589,8 @@ static uint8_t* FindPatternInRange(uint8_t* begin, uint8_t* end, const uint8_t* 
     return nullptr;
 }
 
+// Walk MSVC PGO chained .pdata RUNTIME_FUNCTION entries (tagged pointer bit 0 or UNW_FLAG_CHAININFO == 0x4)
+// so GetFunctionEndOrFallback recovers full contiguous function bounds across split basic-block chunks.
 static DWORD GetRootFunctionBeginRva(DWORD64 image_base, const RUNTIME_FUNCTION* rf) {
     const RUNTIME_FUNCTION* cur = rf;
     for (int depth = 0; depth < 16 && cur; ++depth) {
@@ -2685,6 +2741,7 @@ static void InstallAllHooks() {
     const bool is_modo16 = (front_mod != nullptr);
     g_is_modo16 = is_modo16;
 
+    // Modo 16 splits subsystems across *3000.dll + Qt5; Modo 17 links front/frame/nexus into modo.exe + Qt6 (FBOs in Qt6OpenGL.dll).
     auto* front = reinterpret_cast<uint8_t*>(is_modo16 ? front_mod : GetModuleHandleA(nullptr));
     auto* frame = reinterpret_cast<uint8_t*>(is_modo16 ? GetModuleHandleA("frame3000.dll") : reinterpret_cast<HMODULE>(front));
     auto* nexus = reinterpret_cast<uint8_t*>(is_modo16 ? GetModuleHandleA("nexus3000.dll") : reinterpret_cast<HMODULE>(front));
@@ -2698,7 +2755,7 @@ static void InstallAllHooks() {
     const uint8_t* text_end   = nullptr;
     if (!GetModuleTextBounds(front, &text_begin, &text_end)) return;
 
-    // Problem 6(c): Permanently pin high_dpi_scaling.dll in the process address space
+    // Permanently pin high_dpi_scaling.dll in the process address space
     // before writing any IAT or inline jump pointers into our code pages.
     HMODULE pinned_self = nullptr;
     GetModuleHandleExW(
@@ -2829,6 +2886,9 @@ static void InstallAllHooks() {
             PatchJump14(p_wp_dpr, &HookWPaneGLGetPixelRatio);
         }
 
+        // GnzUI.dll calls int QPaintDevice::devicePixelRatio() (EAX) and converts via
+        // `movd xmm4, eax; cvtdq2pd xmm4, xmm4` (+0x22F6); patch to `movsd xmm4, xmm0; nop4`
+        // and redirect IAT to double devicePixelRatioF() (XMM0).
         auto* gnzui = reinterpret_cast<uint8_t*>(GetModuleHandleA("GnzUI.dll"));
         if (gnzui) {
             void** s_gnz_dpr = FindIATSlot(gnzui, "?devicePixelRatio@QPaintDevice@@QEBAHXZ");
@@ -2848,7 +2908,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Stateless High-DPI rotated vertical tab strip hooks (90 deg CCW and 90 deg CW)
+    // 90 deg CCW Preset Browser group header & 90 deg CW vertical tab strip rotation hooks
     static const uint8_t pat_ccw[31] = {
         0x48, 0x8B, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
         0x4C, 0x8B, 0xC0, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
@@ -2874,6 +2934,7 @@ static void InstallAllHooks() {
     };
     static const uint8_t pat_cw_destroy[4] = { 0x48, 0x8B, 0xCF, 0xE8 };
 
+    // Step back 0x65 bytes from mid-function anchor to prologue (p_fn_ccw), verified via +0x4B/+0x58 compares.
     uint8_t* p_ccw = FindCodePattern(front, is_modo16 ? 0x1F6C05 : 0xD0EE45, pat_ccw, "xxxxxxxxx????xxxxxx????xxxxxxxx", sizeof(pat_ccw));
     if (p_ccw && IsInFrontText(p_ccw, 0x65, sizeof(pat_ccw))) {
         uint8_t* p_fn_ccw = p_ccw - 0x65;
@@ -2887,6 +2948,7 @@ static void InstallAllHooks() {
         }
     }
 
+    // Follow `je p_unrot` at p_cw - 6 to extract stack offset dst_disp_off (p_unrot + 10) and `jmp p_destroy` (p_unrot - 2).
     uint8_t* p_cw = FindCodePattern(front, is_modo16 ? 0x19733C : 0xCF0683, pat_cw, "x????xxxxxxxxxxxx", sizeof(pat_cw));
     if (p_cw && IsInFrontText(p_cw, 6, sizeof(pat_cw)) &&
         p_cw[-6] == 0x0F && p_cw[-5] == 0x84) {
@@ -2911,7 +2973,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Problem 6(a): Resolve FireLazyHandlers address before NOPing out the mid-paint call
+    // Resolve FireLazyHandlers address before NOPing out the mid-paint call
     // inside LUXQt::LUXView::paintEvent so HookAppNotify flushes it safely pre-paint.
     static const uint8_t pat_lazy16[15] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0x41, 0xC6, 0x46, 0x40, 0x01 };
     static const uint8_t pat_lazy17[14] = { 0x33, 0xD2, 0x8D, 0x4A, 0x03, 0xE8, 0, 0, 0, 0, 0xC6, 0x47, 0x38, 0x01 };
@@ -2924,7 +2986,7 @@ static void InstallAllHooks() {
         PatchCodeBytes(p_lazy + 5, kNop5, sizeof(kNop5));
     }
 
-    // Problem 5: Hook LUXQt::LUXView::updateImage (15B clean prologue) & resolve LUXGLWidget::handleScreenChanged
+    // Hook LUXQt::LUXView::updateImage (15B clean prologue) & resolve LUXGLWidget::handleScreenChanged
     static const uint8_t pat_lux_upd[24] = {
         0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57,
         0x48, 0x83, 0xEC, 0x70, 0x48, 0x8B, 0xF9, 0x48,
@@ -2954,7 +3016,7 @@ static void InstallAllHooks() {
         g_luxgl_screen_changed = reinterpret_cast<FnLUXWidgetMethod>(p_gl_scr);
     }
 
-    // Problem 1: WPaneGetPosition & AGLCaptureView hooks
+    // WPaneGetPosition & AGLCaptureView hooks
     static const uint8_t pat_wp_get_pos[56] = {
         0x40, 0x53, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x48,
         0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0x33, 0xC4,
@@ -2974,6 +3036,7 @@ static void InstallAllHooks() {
     uint8_t* p_agl_cap = FindCodePattern(front, is_modo16 ? 0x7AD0 : 0xD2EF50, pat_agl_cap, nullptr, sizeof(pat_agl_cap));
 
     if (p_wp_get && p_agl_cap) {
+        // Extract WPaneGLMakeCurrent from `call rel32` at AGLCaptureView + 0x6F.
         if (p_agl_cap[0x6F] == 0xE8) {
             g_wpane_gl_make_current = reinterpret_cast<FnWPaneGLMakeCurrent>(ResolveRelCallTarget(p_agl_cap + 0x6F));
         }
@@ -2985,7 +3048,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Problem 3.1: IView (Preview viewport) native 1:1 hooks
+    // IView (Preview viewport) native 1:1 hooks
     static const uint8_t pat_iv_zoom[34] = {
         0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10,
         0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20,
@@ -3032,7 +3095,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Problem 3.2: ClipView 2D Tiled Image mipmap selection threshold upgrade
+    // ClipView 2D Tiled Image mipmap selection threshold upgrade
     static const uint8_t pat_cv_loop1[25] = {
         0xF3, 0x0F, 0x10, 0x83, 0x00, 0x01, 0x00, 0x00, 0x0F, 0x2F, 0xC6,
         0x8B, 0x4D, 0xC7, 0x8B, 0x55, 0xCB, 0x76, 0x11,
@@ -3054,7 +3117,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Problem 3.3: Built-in F9 Render Window (RendWin) 1:1 physical display & picking
+    // Built-in F9 Render Window (RendWin) 1:1 physical display & picking
     if (nexus && g_orig_wpane_get_pos) {
         static const uint8_t pat_rw_upd16[35] = {
             0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10,
@@ -3329,6 +3392,8 @@ static void InstallAllHooks() {
                 }
             }
 
+            // Modo 16 centralizes zoom/pan math in RendWinGetScaleAndOffset; Modo 17 inlines it into
+            // CenterAtNormalized, PaneToNormalized, and NormalizedToPane.
             if (is_modo16) {
                 static const uint8_t pat_rw_sc16[17] = {
                     0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x41, 0x54,
@@ -3336,10 +3401,6 @@ static void InstallAllHooks() {
                 };
                 uint8_t* p_sc16 = FindCodePattern(nexus, 0x35CB10, pat_rw_sc16, nullptr, sizeof(pat_rw_sc16));
                 if (p_sc16) {
-                    if (p_sc16[0x27] == 0x48 && p_sc16[0x28] == 0x8B && p_sc16[0x29] == 0x0D) {
-                        int32_t pdisp = *reinterpret_cast<int32_t*>(p_sc16 + 0x2A);
-                        g_rendwin_pane_ptr = reinterpret_cast<void**>(p_sc16 + 0x2E + pdisp);
-                    }
                     g_orig_rendwin_paint       = BuildCleanTrampoline<FnRendWinPaint>(p_rw_paint, 15);
                     g_orig_rw_get_scale_offset = BuildCleanTrampoline<FnRendWinGetScaleAndOffset>(p_sc16, 17);
                     if (g_orig_rendwin_paint && g_orig_rw_get_scale_offset) {
@@ -3367,10 +3428,6 @@ static void InstallAllHooks() {
                 uint8_t* p_p2norm = FindCodePattern(nexus, 0x1BAC30, pat_rw_pane2norm,   nullptr, sizeof(pat_rw_pane2norm));
                 uint8_t* p_norm2p = FindCodePattern(nexus, 0x1BAE90, pat_rw_norm2pane,   nullptr, sizeof(pat_rw_norm2pane));
                 if (p_c_norm && p_p2norm && p_norm2p) {
-                    if (p_p2norm[0x2C] == 0x48 && p_p2norm[0x2D] == 0x8B && p_p2norm[0x2E] == 0x0D) {
-                        int32_t pdisp = *reinterpret_cast<int32_t*>(p_p2norm + 0x2F);
-                        g_rendwin_pane_ptr = reinterpret_cast<void**>(p_p2norm + 0x33 + pdisp);
-                    }
                     g_orig_rendwin_paint      = BuildCleanTrampoline<FnRendWinPaint>(p_rw_paint, 15);
                     g_orig_rw_center_at_norm  = BuildCleanTrampoline<FnRendWinCenterAtNormalized>(p_c_norm, 15);
                     g_orig_rw_pane_to_norm    = BuildCleanTrampoline<FnRendWinPaneToNormalized>(p_p2norm, 15);
@@ -3387,7 +3444,7 @@ static void InstallAllHooks() {
         }
     }
 
-    // Problem 3.4: Third-party .lx IPR IAT hooks & dynamic DLL load listener
+    // Third-party .lx IPR IAT hooks & dynamic DLL load listener
     InstallLxModuleHooks();
 
     g_hooked = true;
@@ -3397,7 +3454,7 @@ static void InstallAllHooks() {
 // 9. Exported C Entry Points
 // ============================================================================
 
-// Problem 2: Force QtGui to evaluate and cache QT_FONT_DPI inside its function-local
+// Force QtGui to evaluate and cache QT_FONT_DPI inside its function-local
 // static inside QPlatformScreen::overrideDpi before Python restores the environment.
 extern "C" __declspec(dllexport) void LockQtOverrideDpi() {
     struct TargetSym {

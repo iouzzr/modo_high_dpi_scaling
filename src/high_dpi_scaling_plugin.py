@@ -486,7 +486,8 @@ def get_system_ppi():
                     except Exception:
                         pass
 
-        # Fallback GDI reconstruction when Shcore per-monitor DPI is unavailable.
+        # GDI fallback when Shcore is unavailable: HORZRES (8) is DWM-virtualized in a DPI-unaware
+        # process while DESKTOPHORZRES (118) is physical, so LOGPIXELSX * DESKTOPHORZRES / HORZRES recovers PPI.
         hdc = _GetDC(None)
         if not hdc:
             return 96
@@ -591,6 +592,8 @@ class HighDPIScalingPersistData(object):
             return False
 
     def _parse_cfg_spec(self, spec_path):
+        # plat.Path("conf") (MODO*.CFG on Windows) is a directory containing HighDPIScaling.cfg,
+        # whereas -config:<file.cfg> / NEXUS_CONFIG may be a file (check it first, then sibling HighDPIScaling.cfg).
         if not spec_path:
             return False
         if os.path.isdir(spec_path):
@@ -937,6 +940,8 @@ def hide_parent_splash_windows():
 
 
 def _prepare_stdio_startupinfo():
+    # Whitelist valid stdio handles via PROC_THREAD_ATTRIBUTE_HANDLE_LIST ("handle_list")
+    # so child Modo preserves stdout/stderr redirection across close_fds=True.
     valid_handles = []
     resolved = []
     for std_id in (_STD_INPUT_HANDLE, _STD_OUTPUT_HANDLE, _STD_ERROR_HANDLE):
@@ -993,6 +998,9 @@ def _create_kill_on_close_job():
 
 
 def run_guardian_bridge(cmd_line, exe_path, child_env):
+    # Keep parent alive waiting on child to preserve PID, exit code, and Job lifetime for
+    # launchers/scripts; retry without startupinfo on invalid/ConPTY handles, and os._exit
+    # directly so the parent never resumes Modo GUI initialization.
     hide_parent_splash_windows()
     startupinfo = _prepare_stdio_startupinfo()
     hjob = _create_kill_on_close_job()
@@ -1054,6 +1062,9 @@ def build_child_environment(mode, effective_scale, base_env=None):
         child_env.pop("QT_SCALE_FACTOR", None)
         child_env["MODO_HIDPI_PMV2"] = "1"
     else:
+        # Fixed-scale ("custom") and 1.0x ("none") modes: HighDpiAware + QT_ENABLE_HIGHDPI_SCALING=0
+        # + QT_FONT_DPI=96 + explicit QT_SCALE_FACTOR lock deterministic scaling and prevent Qt6 in
+        # Modo 17 from auto-scaling when "Do Not Scale" is selected.
         child_env["QT_ENABLE_HIGHDPI_SCALING"] = "0"
         child_env["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
         child_env["QT_FONT_DPI"] = "96"
